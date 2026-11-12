@@ -63,6 +63,10 @@ pub const LATENT_DIM: usize = 512;
 pub const N_HEADS: usize = 64;
 /// `qk_nope_head_dim`, which equals `v_head_dim`.
 pub const NOPE_DIM: usize = 256;
+/// `qk_rope_head_dim` of the full model: the rotated tail of every query head and the shared KV latent.
+pub const ROPE_DIM: usize = 64;
+/// The full model's `qk_nope_head_dim` (its `v_head_dim` is 256, as the Flash model's).
+pub const NOPE_DIM_FULL: usize = 192;
 /// Tokens per cache block (the page size of every paged cache in the engine).
 pub const BLOCK_TOKENS: usize = 256;
 /// Keys per attention chunk (absolute: chunk `c` covers positions `[256 c, 256 c + 256)`).
@@ -96,6 +100,8 @@ fn check_dtype(d: Dtype) -> i32 {
 #[derive(Debug)]
 pub struct LatentCache {
     pub lat: DevBuf,
+    /// The rotated rope key of every token (`[n_blocks][256][64]`), for an MLA with a rotary tail; `None` for the NoPE model.
+    pub rot: Option<DevBuf>,
     pub n_blocks: usize,
     pub dtype: Dtype,
 }
@@ -105,10 +111,24 @@ impl LatentCache {
     pub fn block_bytes(dtype: Dtype) -> usize {
         BLOCK_TOKENS * LATENT_DIM * dtype.size()
     }
-    /// Allocates an (uninitialised) cache of `n_blocks` pages.
+    /// Bytes of one block of rope keys.
+    pub fn rot_block_bytes(dtype: Dtype) -> usize {
+        BLOCK_TOKENS * ROPE_DIM * dtype.size()
+    }
+    /// Allocates an (uninitialised) cache of `n_blocks` pages, without a rope plane.
     pub fn new(n_blocks: usize, dtype: Dtype) -> Result<Self, CudaError> {
         check_dtype(dtype);
-        Ok(Self { lat: DevBuf::alloc(n_blocks * Self::block_bytes(dtype))?, n_blocks, dtype })
+        Ok(Self { lat: DevBuf::alloc(n_blocks * Self::block_bytes(dtype))?, rot: None, n_blocks, dtype })
+    }
+    /// A cache with the rope plane of an MLA that carries a rotary tail.
+    pub fn new_rope(n_blocks: usize, dtype: Dtype) -> Result<Self, CudaError> {
+        check_dtype(dtype);
+        Ok(Self {
+            lat: DevBuf::alloc(n_blocks * Self::block_bytes(dtype))?,
+            rot: Some(DevBuf::alloc(n_blocks * Self::rot_block_bytes(dtype))?),
+            n_blocks,
+            dtype,
+        })
     }
     pub fn capacity_tokens(&self) -> usize {
         self.n_blocks * BLOCK_TOKENS
@@ -174,6 +194,23 @@ impl MlaWeights {
     pub fn bytes(&self) -> usize {
         self.uk.bytes() + self.uvt.bytes()
     }
+}
+
+/// The rotary tables of an MLA with a rotary tail: `(cos, sin)` fp32, one row per position of `max_pos`, `ROPE_DIM / 2` columns,
+/// `inv_freq[i] = 1 / theta^(2 i / ROPE_DIM)` (the reference builds the angles, not their doubles).
+pub fn rope_tables(max_pos: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+    let h = ROPE_DIM / 2;
+    let mut cos = vec![0.0f32; max_pos * h];
+    let mut sin = vec![0.0f32; max_pos * h];
+    for i in 0..h {
+        let inv = 1.0 / theta.powf((2 * i) as f32 / ROPE_DIM as f32);
+        for p in 0..max_pos {
+            let a = p as f32 * inv;
+            cos[p * h + i] = a.cos();
+            sin[p * h + i] = a.sin();
+        }
+    }
+    (cos, sin)
 }
 
 /// Bytes of workspace [`attend`] needs for up to `rows` rows and positions below `max_context`: fp32 chunk partials
@@ -312,6 +349,83 @@ mod ffi {
             dtype: i32,
             stream: *mut c_void,
         ) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn gb_mla_latent_write_rope(
+            lat: *const c_void,
+            kv: *const c_void,
+            kv_stride: i64,
+            rope_off: i32,
+            cos_t: *const c_void,
+            sin_t: *const c_void,
+            table_stride: i32,
+            row_slot: *const i32,
+            row_pos: *const i32,
+            block_table: *const i32,
+            max_blocks: i32,
+            cache: *mut c_void,
+            rot: *mut c_void,
+            rows: i32,
+            dtype: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn gb_mla_absorb_rope(
+            q: *const c_void,
+            q_row_stride: i64,
+            head_stride: i32,
+            rope_off: i32,
+            w_uk: *const c_void,
+            q_lat: *mut c_void,
+            qrot: *mut c_void,
+            cos_t: *const c_void,
+            sin_t: *const c_void,
+            table_stride: i32,
+            row_pos: *const i32,
+            rows: i32,
+            dtype: i32,
+            nh: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn gb_mla_attend_rope(
+            q_lat: *const c_void,
+            qrot: *const c_void,
+            cache: *const c_void,
+            rot: *const c_void,
+            block_table: *const i32,
+            max_blocks: i32,
+            row_slot: *const i32,
+            row_pos: *const i32,
+            dense_limit: i32,
+            out: *mut c_void,
+            rows: i32,
+            max_context: i32,
+            workspace: *mut c_void,
+            workspace_bytes: usize,
+            dtype: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn gb_mla_attend_rope_sparse(
+            q_lat: *const c_void,
+            qrot: *const c_void,
+            cache: *const c_void,
+            rot: *const c_void,
+            block_table: *const i32,
+            max_blocks: i32,
+            row_slot: *const i32,
+            row_pos: *const i32,
+            sel_idx: *const i32,
+            sel_stride: i32,
+            sel_meta: *const i32,
+            out: *mut c_void,
+            rows: i32,
+            max_sel: i32,
+            workspace: *mut c_void,
+            workspace_bytes: usize,
+            dtype: i32,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -336,6 +450,210 @@ pub fn latent_write(
             table.max_blocks as i32,
             cache.lat.ptr(),
             n_rows as i32,
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
+}
+
+/// [`latent_write`] for an MLA with a rotary tail: the normalised latent (`lat`: `T [rows][512]`) and the rotated rope key
+/// (`kv`: `T [rows][kv_stride]`, the key at `rope_off`) go to both planes of the cache. `cos`/`sin`: fp32 `[max_pos][32]`.
+#[allow(clippy::too_many_arguments)]
+pub fn latent_write_rope(
+    lat: &DevBuf,
+    kv: &DevBuf,
+    kv_stride: usize,
+    rope_off: usize,
+    cos: &DevBuf,
+    sin: &DevBuf,
+    table_stride: usize,
+    rows: &RowIndex,
+    table: &BlockTable,
+    cache: &mut LatentCache,
+    n_rows: usize,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    assert!(n_rows <= rows.rows);
+    assert!(lat.bytes() >= n_rows * LATENT_DIM * cache.dtype.size());
+    let rot = cache.rot.as_mut().ok_or(CudaError(1))?;
+    let dt = check_dtype(cache.dtype);
+    let rc = unsafe {
+        ffi::gb_mla_latent_write_rope(
+            lat.ptr(),
+            kv.ptr(),
+            kv_stride as i64,
+            rope_off as i32,
+            cos.ptr(),
+            sin.ptr(),
+            table_stride as i32,
+            rows.slot.ptr() as *const i32,
+            rows.pos.ptr() as *const i32,
+            table.buf.ptr() as *const i32,
+            table.max_blocks as i32,
+            cache.lat.ptr(),
+            rot.ptr(),
+            n_rows as i32,
+            dt,
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
+}
+
+/// [`absorb`] for the full model: the 192-wide nope part is absorbed and the 64-wide rope tail rotated, per head.
+/// `q`: `T [rows][q_row_stride]`, head `h` at `h * head_stride`, its rope tail at `+ rope_off`. `q_lat`: `T [rows][64][512]`;
+/// `qrot`: `T [rows][64][64]`.
+#[allow(clippy::too_many_arguments)]
+pub fn absorb_rope(
+    q: &DevBuf,
+    q_row_stride: usize,
+    head_stride: usize,
+    rope_off: usize,
+    w: &MlaWeights,
+    q_lat: &mut DevBuf,
+    qrot: &mut DevBuf,
+    cos: &DevBuf,
+    sin: &DevBuf,
+    table_stride: usize,
+    rows: &RowIndex,
+    n_rows: usize,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    let dt = check_dtype(w.dtype);
+    assert!(q_row_stride >= N_HEADS * head_stride && q_row_stride % 8 == 0);
+    assert!(n_rows == 0 || q.bytes() >= ((n_rows - 1) * q_row_stride + N_HEADS * head_stride) * w.dtype.size());
+    assert!(q_lat.bytes() >= n_rows * N_HEADS * LATENT_DIM * w.dtype.size());
+    assert!(qrot.bytes() >= n_rows * N_HEADS * ROPE_DIM * w.dtype.size());
+    let rc = unsafe {
+        ffi::gb_mla_absorb_rope(
+            q.ptr(),
+            q_row_stride as i64,
+            head_stride as i32,
+            rope_off as i32,
+            w.uk.ptr(),
+            q_lat.ptr(),
+            qrot.ptr(),
+            cos.ptr(),
+            sin.ptr(),
+            table_stride as i32,
+            rows.pos.ptr() as *const i32,
+            n_rows as i32,
+            dt,
+            N_HEADS as i32,
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
+}
+
+/// [`attend`] for an MLA with a rotary tail: `q_lat` `T [n_rows][64][512]`, `qrot` `T [n_rows][64][64]`, the cache carrying
+/// both planes. Same contract as [`attend`] (dense rows only; `dense_limit` bounds them).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_rope(
+    q_lat: &DevBuf,
+    qrot: &DevBuf,
+    cache: &LatentCache,
+    table: &BlockTable,
+    rows: &RowIndex,
+    n_rows: usize,
+    o_lat: &mut DevBuf,
+    dense_limit: usize,
+    max_context: usize,
+    workspace: &mut DevBuf,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    attend_rope_impl(q_lat, qrot, cache, table, rows, n_rows, o_lat, dense_limit, max_context, workspace, false, stream)
+}
+
+/// [`attend_rope`] for the sparse (DSA) regime; same contract as [`attend_sparse`].
+#[allow(clippy::too_many_arguments)]
+pub fn attend_rope_sparse(
+    q_lat: &DevBuf,
+    qrot: &DevBuf,
+    cache: &LatentCache,
+    table: &BlockTable,
+    rows: &RowIndex,
+    sel: &SparseSel<'_>,
+    n_rows: usize,
+    o_lat: &mut DevBuf,
+    max_sel: usize,
+    workspace: &mut DevBuf,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    let dt = check_dtype(cache.dtype);
+    let rot = cache.rot.as_ref().ok_or(CudaError(1))?;
+    let row_bytes = N_HEADS * LATENT_DIM * cache.dtype.size();
+    assert!(q_lat.bytes() >= n_rows * row_bytes && o_lat.bytes() >= n_rows * row_bytes);
+    assert!(qrot.bytes() >= n_rows * N_HEADS * ROPE_DIM * cache.dtype.size());
+    let need = unsafe { ffi::gb_mla_attend_workspace_bytes(n_rows as i32, max_sel as i32) };
+    assert!(workspace.bytes() >= need, "MLA workspace: {} bytes < {need}", workspace.bytes());
+    let rc = unsafe {
+        ffi::gb_mla_attend_rope_sparse(
+            q_lat.ptr(),
+            qrot.ptr(),
+            cache.lat.ptr(),
+            rot.ptr(),
+            table.buf.ptr() as *const i32,
+            table.max_blocks as i32,
+            rows.slot.ptr() as *const i32,
+            rows.pos.ptr() as *const i32,
+            sel.indices.ptr() as *const i32,
+            sel.stride as i32,
+            sel.meta.ptr() as *const i32,
+            o_lat.ptr(),
+            n_rows as i32,
+            max_sel as i32,
+            workspace.ptr(),
+            workspace.bytes(),
+            dt,
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attend_rope_impl(
+    q_lat: &DevBuf,
+    qrot: &DevBuf,
+    cache: &LatentCache,
+    table: &BlockTable,
+    rows: &RowIndex,
+    n_rows: usize,
+    o_lat: &mut DevBuf,
+    dense_limit: usize,
+    max_context: usize,
+    workspace: &mut DevBuf,
+    sparse: bool,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    let dt = check_dtype(cache.dtype);
+    let rot = cache.rot.as_ref().ok_or(CudaError(1))?;
+    assert!((1..=MAX_ROWS).contains(&n_rows) && n_rows <= rows.rows);
+    let row_bytes = N_HEADS * LATENT_DIM * cache.dtype.size();
+    assert!(q_lat.bytes() >= n_rows * row_bytes && o_lat.bytes() >= n_rows * row_bytes);
+    assert!(qrot.bytes() >= n_rows * N_HEADS * ROPE_DIM * cache.dtype.size());
+    assert!(max_context >= 1 && max_context <= table.max_blocks * BLOCK_TOKENS, "max_context exceeds the block table");
+    let need = unsafe { ffi::gb_mla_attend_workspace_bytes(n_rows as i32, max_context as i32) };
+    assert!(workspace.bytes() >= need, "MLA workspace: {} bytes < {need}", workspace.bytes());
+    let _ = sparse;
+    let rc = unsafe {
+        ffi::gb_mla_attend_rope(
+            q_lat.ptr(),
+            qrot.ptr(),
+            cache.lat.ptr(),
+            rot.ptr(),
+            table.buf.ptr() as *const i32,
+            table.max_blocks as i32,
+            rows.slot.ptr() as *const i32,
+            rows.pos.ptr() as *const i32,
+            dense_limit.min(i32::MAX as usize) as i32,
+            o_lat.ptr(),
+            n_rows as i32,
+            max_context as i32,
+            workspace.ptr(),
+            workspace.bytes(),
+            dt,
             stream.raw(),
         )
     };

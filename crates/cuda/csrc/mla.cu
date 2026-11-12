@@ -55,6 +55,8 @@
 namespace {
 
 constexpr int DC = 512;          // latent width (kv_lora_rank)
+constexpr int RD = 64;           // rotary tail of a full-GLM MLA (qk_rope_head_dim)
+constexpr int RH = RD / 2;       // rotary pairs / frequencies
 constexpr int NH = 64;           // heads
 constexpr int DN = 256;          // qk_nope_head_dim == v_head_dim
 constexpr int PAGE = 256;        // tokens per block
@@ -179,6 +181,61 @@ __global__ void __launch_bounds__(64) latent_write_kernel(const uint4* __restric
     cache[dst + threadIdx.x] = lat[(int64_t)r * (DC / 8) + threadIdx.x];
 }
 
+// ---------------------------------------------------------------- rope: kv write and query preparation (full GLM)
+
+// One block per row, 64 threads: the row's 512 normalized latent values to (block, token) of its slot, and its 64-value rope key
+// rotated (interleaved pairs, half-split storage) into the rot plane; a negative position skips.
+template <typename T>
+__global__ void __launch_bounds__(64) latent_write_rope_kernel(const uint4* __restrict__ lat, const T* __restrict__ kv,
+                                                               int64_t kv_stride, int rope_off, const float* __restrict__ ct,
+                                                               const float* __restrict__ st, int table_stride,
+                                                               const int* __restrict__ row_slot, const int* __restrict__ row_pos,
+                                                               const int* __restrict__ table, int max_blocks,
+                                                               uint4* __restrict__ cache, T* __restrict__ rot) {
+    const int r = blockIdx.x;
+    const int pos = row_pos[r];
+    if (pos < 0) return;
+    const int blk = table[(int64_t)row_slot[r] * max_blocks + pos / PAGE];
+    const int64_t entry = (int64_t)blk * PAGE + pos % PAGE;
+    cache[entry * (DC / 8) + threadIdx.x] = lat[(int64_t)r * (DC / 8) + threadIdx.x];
+    const int t = threadIdx.x;
+    if (t < RH) {
+        const T* src = kv + (int64_t)r * kv_stride + rope_off;
+        const float c = __ldg(ct + (int64_t)pos * table_stride + t);
+        const float s = __ldg(st + (int64_t)pos * table_stride + t);
+        const float x0 = to_f32(src[2 * t]), x1 = to_f32(src[2 * t + 1]);
+        const float y0 = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+        const float y1 = __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
+        T* dst = rot + entry * RD;
+        dst[t] = from_f32<T>(y0);
+        dst[t + RH] = from_f32<T>(y1);
+    }
+}
+
+// q rope: one block per row, up to 256 threads = nh x 32 (head, pair): y[i] = x[2i] c - x[2i+1] s, y[i+32] = x[2i] s + x[2i+1] c.
+template <typename T>
+__global__ void __launch_bounds__(256) q_rot_kernel(const T* __restrict__ q, int64_t q_stride, int head_stride, int rope_off,
+                                                    const float* __restrict__ ct, const float* __restrict__ st, int table_stride,
+                                                    const int* __restrict__ row_pos, T* __restrict__ qrot, int nh) {
+    const int r = blockIdx.x;
+    for (int t = threadIdx.x; t < nh * RH; t += blockDim.x) {
+    const int h = t / RH, i = t % RH;
+    T* dst = qrot + ((int64_t)r * nh + h) * RD;
+    const int pos = row_pos[r];
+    if (pos < 0) {
+        dst[i] = from_f32<T>(0.0f);
+        dst[i + RH] = from_f32<T>(0.0f);
+        return;
+    }
+    const T* src = q + (int64_t)r * q_stride + (int64_t)h * head_stride + rope_off;
+    const float c = __ldg(ct + (int64_t)pos * table_stride + i);
+    const float s = __ldg(st + (int64_t)pos * table_stride + i);
+    const float x0 = to_f32(src[2 * i]), x1 = to_f32(src[2 * i + 1]);
+    dst[i] = from_f32<T>(__fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s)));
+    dst[i + RH] = from_f32<T>(__fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c)));
+    }
+}
+
 // ---------------------------------------------------------------- absorb / expand: per-head skinny GEMM, fixed-order fp32 chains
 
 // y[r][h][j] = round_T( sum_{k = 0..K-1} x[r][h][k] * W[h][k][j] ), k ascending, one __fmaf_rn chain per output element.
@@ -187,8 +244,8 @@ __global__ void __launch_bounds__(64) latent_write_kernel(const uint4* __restric
 // memory (a broadcast read per FMA group); rows past `rows` are zero and never stored. The per-row operation sequence is
 // independent of RB, so every instantiation gives identical bits for a row.
 template <typename T, int K, int J, int CPT, int RB, int UNROLL>
-__global__ void __launch_bounds__(32) skinny_kernel(const T* __restrict__ x, int64_t x_stride, const T* __restrict__ w,
-                                                    T* __restrict__ y, int64_t y_stride, int rows) {
+__global__ void __launch_bounds__(32) skinny_kernel(const T* __restrict__ x, int64_t x_stride, int x_head_stride,
+                                                    const T* __restrict__ w, T* __restrict__ y, int64_t y_stride, int rows) {
     static_assert(K % UNROLL == 0 && UNROLL % 4 == 0 && K % 8 == 0, "tiling");
     static_assert(CPT == 4 || CPT == 8, "16-byte or 8-byte weight loads");
     __shared__ __align__(16) float sx[RB * K];
@@ -201,7 +258,7 @@ __global__ void __launch_bounds__(32) skinny_kernel(const T* __restrict__ x, int
             const int rr = i / (K / 8), c8 = i % (K / 8);
             float v[8];
             if (r0 + rr < rows) {
-                const uint4 u = *reinterpret_cast<const uint4*>(x + (int64_t)(r0 + rr) * x_stride + (int64_t)h * K + c8 * 8);
+                const uint4 u = *reinterpret_cast<const uint4*>(x + (int64_t)(r0 + rr) * x_stride + (int64_t)h * x_head_stride + c8 * 8);
                 const uint32_t uw[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
                 for (int e = 0; e < 4; ++e) unpack2<T>(uw[e], v[2 * e], v[2 * e + 1]);
@@ -263,8 +320,8 @@ __global__ void __launch_bounds__(32) skinny_kernel(const T* __restrict__ x, int
 
 // nh: heads of the call (a block a head; x, w and y point at the first of them): NH for the whole layer, a rank's share of a head split.
 template <typename T, int K, int J, int CPT, int RB, int UNROLL>
-int launch_skinny(const T* x, int64_t xs, const T* w, T* y, int64_t ys, int rows, int nh, cudaStream_t s) {
-    skinny_kernel<T, K, J, CPT, RB, UNROLL><<<dim3(J / (32 * CPT), nh), 32, 0, s>>>(x, xs, w, y, ys, rows);
+int launch_skinny(const T* x, int64_t xs, int xhs, const T* w, T* y, int64_t ys, int rows, int nh, cudaStream_t s) {
+    skinny_kernel<T, K, J, CPT, RB, UNROLL><<<dim3(J / (32 * CPT), nh), 32, 0, s>>>(x, xs, xhs, w, y, ys, rows);
     return GB_CHECK_LAUNCH();
 }
 
@@ -272,17 +329,28 @@ template <typename T> int absorb_t(const void* q, int64_t qs, const void* w, voi
     const T *x = (const T*)q, *wp = (const T*)w;
     T* y = (T*)out;
     const int64_t ys = (int64_t)nh * DC;
-    if (rows <= 1) return launch_skinny<T, DN, DC, 8, 1, 8>(x, qs, wp, y, ys, rows, nh, s);
-    if (rows <= 4) return launch_skinny<T, DN, DC, 8, 4, 8>(x, qs, wp, y, ys, rows, nh, s);
-    return launch_skinny<T, DN, DC, 8, 16, 8>(x, qs, wp, y, ys, rows, nh, s);
+    if (rows <= 1) return launch_skinny<T, DN, DC, 8, 1, 8>(x, qs, DN, wp, y, ys, rows, nh, s);
+    if (rows <= 4) return launch_skinny<T, DN, DC, 8, 4, 8>(x, qs, DN, wp, y, ys, rows, nh, s);
+    return launch_skinny<T, DN, DC, 8, 16, 8>(x, qs, DN, wp, y, ys, rows, nh, s);
 }
+// The full model's absorb: qk_nope_head_dim = 192 (the rope tail of 64 is not absorbed).
+constexpr int DNF = 192;
+template <typename T> int absorb_rope_t(const void* q, int64_t qs, const void* w, void* out, int rows, int nh, cudaStream_t s) {
+    const T *x = (const T*)q, *wp = (const T*)w;
+    T* y = (T*)out;
+    const int64_t ys = (int64_t)nh * DC;
+    if (rows <= 1) return launch_skinny<T, DNF, DC, 8, 1, 8>(x, qs, DNF + RD, wp, y, ys, rows, nh, s);
+    if (rows <= 4) return launch_skinny<T, DNF, DC, 8, 4, 8>(x, qs, DNF + RD, wp, y, ys, rows, nh, s);
+    return launch_skinny<T, DNF, DC, 8, 16, 8>(x, qs, DNF + RD, wp, y, ys, rows, nh, s);
+}
+
 template <typename T> int expand_t(const void* o_lat, const void* w, void* out, int rows, int nh, cudaStream_t s) {
     const T *x = (const T*)o_lat, *wp = (const T*)w;
     T* y = (T*)out;
     const int64_t xs = (int64_t)nh * DC, ys = (int64_t)nh * DN;
-    if (rows <= 1) return launch_skinny<T, DC, DN, 4, 1, 16>(x, xs, wp, y, ys, rows, nh, s);
-    if (rows <= 4) return launch_skinny<T, DC, DN, 4, 4, 16>(x, xs, wp, y, ys, rows, nh, s);
-    return launch_skinny<T, DC, DN, 4, 16, 8>(x, xs, wp, y, ys, rows, nh, s);
+    if (rows <= 1) return launch_skinny<T, DC, DN, 4, 1, 16>(x, xs, DC, wp, y, ys, rows, nh, s);
+    if (rows <= 4) return launch_skinny<T, DC, DN, 4, 4, 16>(x, xs, DC, wp, y, ys, rows, nh, s);
+    return launch_skinny<T, DC, DN, 4, 16, 8>(x, xs, DC, wp, y, ys, rows, nh, s);
 }
 
 // ---------------------------------------------------------------- attention over the latent
@@ -299,11 +367,12 @@ struct Soft {
 // every warp of the head tile, so all four hold identical scores and run identical softmax arithmetic), and accumulates
 // the output columns of its quarter (64 fp32 registers). K and V are the same tile, shared by the MT head tiles.
 // A pair's arithmetic does not depend on MT, so every MT gives identical bits (tested).
-template <typename T, int KT, int CH, int MT, bool SPARSE>
+template <typename T, int KT, int CH, int MT, bool SPARSE, bool ROPE = false>
 __global__ void __launch_bounds__(128 * MT)
 mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* __restrict__ table, int max_blocks,
                    const int* __restrict__ row_slot, const int* __restrict__ row_pos, int dense_limit,
                    const int* __restrict__ sel_idx, int sel_stride, const int* __restrict__ sel_meta, int nch_max,
+                   const T* __restrict__ qrot, const T* __restrict__ rot,
                    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int nh) {
     constexpr int NBS = KT / 8;           // n8 blocks of scores per tile
     constexpr int NKS = KT / 16;          // k16 steps of the PV product per tile
@@ -313,6 +382,9 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
     static_assert(PAGE % KT == 0 && CH % KT == 0 && (KT == 16 || KT == 32) && (MT == 1 || MT == 2) && (!SPARSE || MT == 1), "tiling");
     extern __shared__ uint4 smem[];
     float4* sx = reinterpret_cast<float4*>(smem + 2 * NWARP * TILE_U4);
+    // rope staging: two stages of KT x 64 rope keys, and this CTA's 16 heads' rope queries (full-GLM path only)
+    T* srot = reinterpret_cast<T*>(sx + 2 * MT * NWARP * SX_F4);
+    T* sqrot = srot + 2 * KT * RD;
     const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, qd = lane & 3, mt = lane >> 3;
     const int w = wid & (NWARP - 1), mi = wid / NWARP;  // d-quarter, head tile within the CTA
     const int GRP = (nh / HT) / MT;                      // CTAs per row along the heads (nh: the call's heads, NH or a rank's share)
@@ -386,6 +458,32 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
                 cp16z(smem + (st * NWARP + q) * TILE_U4 + j * PQ + (c ^ (j & 7)), in ? base + (int64_t)j * DC + p * 8 : lat, in);
             }
         }
+        if constexpr (ROPE) {
+            // the tile's 64-wide rope keys, at (block, token) of the same keys the lattice staged
+            if constexpr (SPARSE) {
+                const int e = key0 + lane;
+                const int pl = (any && e < limit) ? sel_idx[(int64_t)row * sel_stride + e] : -1;
+                const int bl = pl >= 0 ? tbl[pl / PAGE] : 0;
+                const int pj0 = pl;
+                (void)pj0;
+                for (int idx = lane; idx < KT * 8; idx += 32) {
+                    const int j = idx / 8, c = idx % 8;
+                    const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
+                    const bool in = pj >= 0;
+                    cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
+                          in ? rot + (((int64_t)bj * PAGE + pj % PAGE) * RD) + c * 8 : rot, in);
+                }
+            } else {
+                const int blk = any ? tbl[key0 / PAGE] : 0;
+                const T* rbase = rot + ((int64_t)blk * PAGE + key0 % PAGE) * RD;
+                for (int idx = lane; idx < KT * 8; idx += 32) {
+                    const int j = idx / 8, c = idx % 8;
+                    const bool in = any && key0 + j < limit;
+                    cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
+                          in ? rbase + (int64_t)j * RD + c * 8 : rot, in);
+                }
+            }
+        }
     };
     stage(0, 0);
     commit();
@@ -394,6 +492,13 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
         commit();
     }
 
+    if constexpr (ROPE) {
+        // this CTA's head tile's rope queries, [HT][RD], for the rope dot
+        for (int i = tid; i < HT * RD / 8; i += NTHR) {
+            const uint4 v = *reinterpret_cast<const uint4*>(qrot + ((int64_t)row * nh + hb * HT) * RD + i * 8);
+            *reinterpret_cast<uint4*>(sqrot + i * 8) = v;
+        }
+    }
     // ---- this warp's quarter of the 16 heads' q_lat as A fragments (k16 steps 0..7 of its 128 columns)
     uint32_t qa[DQ / 16][4];
     {
@@ -436,6 +541,32 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
                 } else {
                     mma<T>(s[n], qa[k], b[0], b[1]);
                     mma<T>(s[n + 1], qa[k], b[2], b[3]);
+                }
+            }
+        }
+        if constexpr (ROPE) {
+            // the rope term: (q_rot[h] . k_rot[key]) added to one quarter's partial, the exchange sums it once per score
+#pragma unroll
+            for (int n = 0; n < NBS; ++n) {
+                if ((n % NWARP) == w) {
+                    const int kb = 8 * n + 2 * qd;
+                    const T* kr0 = srot + (t & 1) * KT * RD + kb * RD;
+                    const T* kr1 = kr0 + RD;
+                    const T* qg = sqrot + g * RD;
+                    const T* qg8 = sqrot + (g + 8) * RD;
+                    float d00 = 0.0f, d01 = 0.0f, d10 = 0.0f, d11 = 0.0f;
+#pragma unroll 8
+                    for (int d = 0; d < RD; ++d) {
+                        const float k0 = to_f32(kr0[d]), k1 = to_f32(kr1[d]);
+                        d00 = __fmaf_rn(to_f32(qg[d]), k0, d00);
+                        d01 = __fmaf_rn(to_f32(qg[d]), k1, d01);
+                        d10 = __fmaf_rn(to_f32(qg8[d]), k0, d10);
+                        d11 = __fmaf_rn(to_f32(qg8[d]), k1, d11);
+                    }
+                    s[n][0] = __fadd_rn(s[n][0], d00);
+                    s[n][1] = __fadd_rn(s[n][1], d01);
+                    s[n][2] = __fadd_rn(s[n][2], d10);
+                    s[n][3] = __fadd_rn(s[n][3], d11);
                 }
             }
         }
@@ -639,10 +770,36 @@ int attend_t(const void* q_lat, const void* cache, const int* table, int max_blo
     float* pl = (float*)((char*)workspace + align256(pairs * DC * 4) + align256(pairs * 4));
     mla_partial_kernel<T, KT, CH, MT, SPARSE><<<dim3(rows * ((nh / HT) / MT), nch), 128 * MT, SMEM, s>>>(
         (const T*)q_lat, (const T*)cache, table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta,
-        nch, po, pm, pl, nh);
+        nch, nullptr, nullptr, po, pm, pl, nh);
     int rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
     mla_merge_kernel<T, CH, SPARSE><<<dim3(nh, rows), DC / 4, 0, s>>>(po, pm, pl, row_pos, dense_limit, sel_meta, (T*)out, nch, nh);
+    return GB_CHECK_LAUNCH();
+}
+
+// The full model's attention: the same tiling with the rope term (a 64-wide rotated key plane per token).
+template <typename T, int KT, int CH, int MT, bool SPARSE>
+int attend_rope_t(const void* q_lat, const void* qrot, const void* cache, const void* rot, const int* table, int max_blocks,
+                  const int* row_slot, const int* row_pos, int dense_limit, const int* sel_idx, int sel_stride,
+                  const int* sel_meta, void* out, int rows, int max_context, void* workspace, size_t workspace_bytes,
+                  cudaStream_t s) {
+    constexpr int SMEM = 2 * NWARP * KT * PQ * 16 + 2 * MT * NWARP * (KT / 8) * 32 * 16 + (2 * KT * RD + HT * RD) * 2;
+    if (workspace_bytes < workspace_bytes_ch<CH>(rows, max_context) || !workspace) return (int)cudaErrorInvalidValue;
+    static const cudaError_t configured =
+        cudaFuncSetAttribute(mla_partial_kernel<T, KT, CH, MT, SPARSE, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    if (configured != cudaSuccess) return (int)configured;
+    const int nch = (max_context + CH - 1) / CH;
+    if (nch > 65535) return (int)cudaErrorInvalidValue;
+    const size_t pairs = (size_t)rows * NH * nch;
+    float* po = (float*)workspace;
+    float* pm = (float*)((char*)workspace + align256(pairs * DC * 4));
+    float* pl = (float*)((char*)workspace + align256(pairs * DC * 4) + align256(pairs * 4));
+    mla_partial_kernel<T, KT, CH, MT, SPARSE, true><<<dim3(rows * ((NH / HT) / MT), nch), 128 * MT, SMEM, s>>>(
+        (const T*)q_lat, (const T*)cache, table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta,
+        nch, (const T*)qrot, (const T*)rot, po, pm, pl, NH);
+    int rc = GB_CHECK_LAUNCH();
+    if (rc) return rc;
+    mla_merge_kernel<T, CH, SPARSE><<<dim3(NH, rows), DC / 4, 0, s>>>(po, pm, pl, row_pos, dense_limit, sel_meta, (T*)out, nch, NH);
     return GB_CHECK_LAUNCH();
 }
 
@@ -689,6 +846,48 @@ GB_EXPORT int gb_mla_latent_write(const void* lat, const int* row_slot, const in
     if (rows == 0) return 0;
     latent_write_kernel<<<rows, DC / 8, 0, gb_stream(stream)>>>((const uint4*)lat, row_slot, row_pos, block_table,
                                                                 max_blocks, (uint4*)cache);
+    return GB_CHECK_LAUNCH();
+}
+
+// The full model: normalized latent (512) + rotated rope key (64) into both planes of the layer's cache.
+GB_EXPORT int gb_mla_latent_write_rope(const void* lat, const void* kv, int64_t kv_stride, int rope_off, const void* cos_t,
+                                       const void* sin_t, int table_stride, const int* row_slot, const int* row_pos,
+                                       const int* block_table, int max_blocks, void* cache, void* rot, int rows, int dtype,
+                                       void* stream) {
+    if (rows < 0 || max_blocks <= 0 || kv_stride < rope_off + RD || dtype < 0 || dtype > 1)
+        return (int)cudaErrorInvalidValue;
+    if (rows == 0) return 0;
+    cudaStream_t s = gb_stream(stream);
+    if (dtype == 1)
+        latent_write_rope_kernel<bf16><<<rows, DC / 8, 0, s>>>((const uint4*)lat, (const bf16*)kv, kv_stride, rope_off,
+                                                               (const float*)cos_t, (const float*)sin_t, table_stride,
+                                                               row_slot, row_pos, block_table, max_blocks, (uint4*)cache,
+                                                               (bf16*)rot);
+    else
+        latent_write_rope_kernel<f16><<<rows, DC / 8, 0, s>>>((const uint4*)lat, (const f16*)kv, kv_stride, rope_off,
+                                                              (const float*)cos_t, (const float*)sin_t, table_stride,
+                                                              row_slot, row_pos, block_table, max_blocks, (uint4*)cache,
+                                                              (f16*)rot);
+    return GB_CHECK_LAUNCH();
+}
+
+// The full model's query preparation: absorb the 192-wide nope part, rotate the 64-wide rope tail.
+GB_EXPORT int gb_mla_absorb_rope(const void* q, int64_t q_row_stride, int head_stride, int rope_off, const void* w_uk,
+                                 void* q_lat, void* qrot, const void* cos_t, const void* sin_t, int table_stride,
+                                 const int* row_pos, int rows, int dtype, int nh, void* stream) {
+    if (rows < 0 || dtype < 0 || dtype > 1 || nh < HT || nh > NH || nh % HT) return (int)cudaErrorInvalidValue;
+    if (rows == 0) return 0;
+    if (head_stride < DNF + RD || rope_off < DNF || q_row_stride < (int64_t)nh * head_stride) return (int)cudaErrorInvalidValue;
+    cudaStream_t s = gb_stream(stream);
+    const int rc = dtype == 1 ? absorb_rope_t<bf16>(q, q_row_stride, w_uk, q_lat, rows, nh, s)
+                              : absorb_rope_t<f16>(q, q_row_stride, w_uk, q_lat, rows, nh, s);
+    if (rc) return rc;
+    if (dtype == 1)
+        q_rot_kernel<bf16><<<rows, 256, 0, s>>>((const bf16*)q, q_row_stride, head_stride, rope_off, (const float*)cos_t,
+                                                   (const float*)sin_t, table_stride, row_pos, (bf16*)qrot, nh);
+    else
+        q_rot_kernel<f16><<<rows, 256, 0, s>>>((const f16*)q, q_row_stride, head_stride, rope_off, (const float*)cos_t,
+                                                  (const float*)sin_t, table_stride, row_pos, (f16*)qrot, nh);
     return GB_CHECK_LAUNCH();
 }
 
@@ -752,6 +951,38 @@ GB_EXPORT int gb_mla_attend_sparse(const void* q_lat, const void* cache, const i
                       : attend_t<f16, DEF_KT, DEF_CH, 1, true>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, 0,
                                                                 sel_idx, sel_stride, sel_meta, out, rows, max_sel, workspace,
                                                                 workspace_bytes, s);
+}
+
+// The full model's attention: q_lat [rows][64][512] and qrot [rows][64][64]; cache latents [blocks][256][512] and rope keys
+// [blocks][256][64]. Same contract as gb_mla_attend_variant (dense) and gb_mla_attend_sparse (sparse).
+GB_EXPORT int gb_mla_attend_rope(const void* q_lat, const void* qrot, const void* cache, const void* rot,
+                                 const int* block_table, int max_blocks, const int* row_slot, const int* row_pos,
+                                 int dense_limit, void* out, int rows, int max_context, void* workspace,
+                                 size_t workspace_bytes, int dtype, void* stream) {
+    if (rows < 1 || rows > MAX_ROWS || max_context < 1 || max_blocks <= 0 || dtype < 0 || dtype > 1)
+        return (int)cudaErrorInvalidValue;
+    cudaStream_t s = gb_stream(stream);
+    return dtype == 1 ? attend_rope_t<bf16, DEF_KT, DEF_CH, 1, false>(q_lat, qrot, cache, rot, block_table, max_blocks,
+                                                                      row_slot, row_pos, dense_limit, nullptr, 0, nullptr,
+                                                                      out, rows, max_context, workspace, workspace_bytes, s)
+                      : attend_rope_t<f16, DEF_KT, DEF_CH, 1, false>(q_lat, qrot, cache, rot, block_table, max_blocks,
+                                                                     row_slot, row_pos, dense_limit, nullptr, 0, nullptr,
+                                                                     out, rows, max_context, workspace, workspace_bytes, s);
+}
+
+GB_EXPORT int gb_mla_attend_rope_sparse(const void* q_lat, const void* qrot, const void* cache, const void* rot,
+                                        const int* block_table, int max_blocks, const int* row_slot, const int* row_pos,
+                                        const int* sel_idx, int sel_stride, const int* sel_meta, void* out, int rows,
+                                        int max_sel, void* workspace, size_t workspace_bytes, int dtype, void* stream) {
+    if (rows < 1 || rows > MAX_ROWS || max_sel < 1 || sel_stride < max_sel || max_blocks <= 0 || dtype < 0 || dtype > 1)
+        return (int)cudaErrorInvalidValue;
+    cudaStream_t s = gb_stream(stream);
+    return dtype == 1 ? attend_rope_t<bf16, DEF_KT, DEF_CH, 1, true>(q_lat, qrot, cache, rot, block_table, max_blocks,
+                                                                     row_slot, row_pos, 0, sel_idx, sel_stride, sel_meta,
+                                                                     out, rows, max_sel, workspace, workspace_bytes, s)
+                      : attend_rope_t<f16, DEF_KT, DEF_CH, 1, true>(q_lat, qrot, cache, rot, block_table, max_blocks,
+                                                                    row_slot, row_pos, 0, sel_idx, sel_stride, sel_meta,
+                                                                    out, rows, max_sel, workspace, workspace_bytes, s);
 }
 
 // ---------------------------------------------------------------- a rank's heads (lane E, the TP head split)
