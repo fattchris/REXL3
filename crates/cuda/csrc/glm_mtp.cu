@@ -266,6 +266,25 @@ __global__ void keyed_pick_k(const int* __restrict__ ids, const float* __restric
 
 // ids i32 / vals f32 [rows, count] (count <= 64, sorted by (value desc, id asc)), params KeyedRow [rows] (48 bytes each), out_ids i32 / out_vals f32 [rows].
 // `depth` is the chain depth of this call (0 for the first draft): the noise of row r is drawn at params[r].first_position + depth.
+// One block per row: the row's bf16 embedding row widened to fp32 (the residual stream of the plain trunk).
+__global__ void __launch_bounds__(128) embed_f32_kernel(const __nv_bfloat16* __restrict__ table, const int* __restrict__ ids,
+                                                        float* __restrict__ out, int vocab, int dim) {
+    const int r = blockIdx.x, id = ids[r];
+    const int nvec = dim / 8;
+    for (int v = threadIdx.x; v < nvec; v += blockDim.x) {
+        const uint4 u = *reinterpret_cast<const uint4*>(table + (int64_t)(id >= 0 && id < vocab ? id : 0) * dim + v * 8);
+        const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+        float* o = out + (int64_t)r * dim + v * 8;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float lo = __bfloat162float(*(const __nv_bfloat16*)&w[e]);
+            const __nv_bfloat16 hi_b = *(const __nv_bfloat16*)((const char*)&w[e] + 2);
+            o[2 * e] = lo;
+            o[2 * e + 1] = __bfloat162float(hi_b);
+        }
+    }
+}
+
 GB_EXPORT int gb_glm_keyed_pick(const int* ids, const float* vals, int count, int rows, const void* params, int depth, int* out_ids, float* out_vals,
                                 void* stream) {
     if (rows < 0 || count < 1 || count > 64 || depth < 0) return ERR_INVALID;
@@ -296,6 +315,13 @@ GB_EXPORT int gb_glm_mtp_embed_f32(const void* feat, const float* we, void* out,
 }
 
 // y fp16 = f16((x * inv) * w), x fp32 [rows, dim], w fp32 [dim]. dim % 8 == 0.
+GB_EXPORT int gb_glm_embed_f32(const void* table, const int* ids, void* out, int rows, int vocab, int dim, void* stream) {
+    if (rows < 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    if (rows == 0) return 0;
+    embed_f32_kernel<<<rows, 128, 0, gb_stream(stream)>>>((const __nv_bfloat16*)table, ids, (float*)out, vocab, dim);
+    return GB_CHECK_LAUNCH();
+}
+
 GB_EXPORT int gb_glm_rmsnorm_f32_f16(const void* x, const void* w, void* y, int rows, int dim, float eps, void* stream) {
     if (rows < 0 || dim < 8 || dim % 8 != 0) return ERR_INVALID;
     if (rows == 0) return 0;

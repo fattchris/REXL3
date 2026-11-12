@@ -119,7 +119,7 @@ pub(super) struct MlaCtx<'a> {
 }
 
 /// Rows `a .. a + n` of a row index.
-fn slab_index(ri: &RowIndex, a: usize, n: usize) -> RowIndex {
+pub(super) fn slab_index(ri: &RowIndex, a: usize, n: usize) -> RowIndex {
     RowIndex { slot: ri.slot.subview(a * 4, n * 4), pos: ri.pos.subview(a * 4, n * 4), rows: n }
 }
 
@@ -146,7 +146,7 @@ pub(super) fn mla_dsa_mixer(
         Some(r) => r,
         None => &s.rowidx,
     };
-    let ix = &w.indexer;
+    let ix = w.indexer.as_ref().ok_or_else(|| ModelError::Config("the layer has no indexer".into()))?;
     let h = cfg.hidden;
     lin(&w.q_a, &s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
     glm_glue::rmsnorm_f16(&s.q_a, &w.q_a_norm, &mut s.q_resid, rows, cfg.mla.q_lora_rank, RMS_EPS, st)?;
@@ -251,7 +251,7 @@ pub(super) fn mla_dsa_mixer_heads(
     assert!(!big, "the MLA head split runs windows and small chunks only");
     assert!(path == LinPath::Decode, "the MLA head split runs the decode kernels (a P2 prompt chunk never takes it)");
     let (h0, nh) = t.mla_heads().ok_or_else(|| ModelError::Config("no MLA head split".into()))?;
-    let ix = &w.indexer;
+    let ix = w.indexer.as_ref().ok_or_else(|| ModelError::Config("the layer has no indexer".into()))?;
     let h = cfg.hidden;
     let qk = cfg.mla.qk_head_dim();
     lin(&w.q_a, &s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;

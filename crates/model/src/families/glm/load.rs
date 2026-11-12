@@ -160,6 +160,24 @@ pub fn convert(x: Xform, src: &[u8]) -> Result<Vec<u8>, String> {
             }
             Ok(out)
         }
+        Xform::PackKvBFull => {
+            let rows = mla::N_HEADS * (mla::NOPE_DIM_FULL + mla::NOPE_DIM) * mla::LATENT_DIM;
+            if src.len() != rows * 2 {
+                return Err(format!("kv_b_proj has {} bytes, expected {}", src.len(), rows * 2));
+            }
+            let bits: Vec<u16> = src.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let (uk, uvt) = mla::pack_kv_b_full(&bits, Dtype::F16, Dtype::F16);
+            Ok(uk.iter().chain(uvt.iter()).flat_map(|v| v.to_le_bytes()).collect())
+        }
+        Xform::PackKvBFullBf16 => {
+            let rows = mla::N_HEADS * (mla::NOPE_DIM_FULL + mla::NOPE_DIM) * mla::LATENT_DIM;
+            if src.len() != rows * 2 {
+                return Err(format!("kv_b_proj has {} bytes, expected {}", src.len(), rows * 2));
+            }
+            let bits: Vec<u16> = src.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let (uk, uvt) = mla::pack_kv_b_full(&bits, Dtype::BF16, Dtype::F16);
+            Ok(uk.iter().chain(uvt.iter()).flat_map(|v| v.to_le_bytes()).collect())
+        }
         Xform::PackKvBBf16 => {
             let rows = mla::N_HEADS * mla::KV_B_ROWS_PER_HEAD * mla::LATENT_DIM;
             if src.len() != rows * 2 {

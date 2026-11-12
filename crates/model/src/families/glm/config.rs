@@ -974,7 +974,14 @@ impl GlmConfig {
             full += self.mtp.len() as u64;
         }
         let latent = KvPlane::per_token("latent", self.mla.kv_lora_rank as u64, KV_ELEM_BYTES);
+        // an MLA with a rotary tail caches the rotated key beside the latent
+        let rot = (self.mla.qk_rope_head_dim > 0).then(|| {
+            KvPlane::per_token("rot", self.mla.qk_rope_head_dim as u64, KV_ELEM_BYTES)
+        });
         let mut with_indexer = vec![latent];
+        if let Some(r) = rot {
+            with_indexer.push(r);
+        }
         if self.indexer.kpool > 0 {
             with_indexer.push(KvPlane::pooled(
                 "indexer_pool",
@@ -991,7 +998,11 @@ impl GlmConfig {
             layout = layout.with(KvLayerClass { name: "mla_dsa_full_indexer", layers: full, planes: with_indexer });
         }
         if shared > 0 {
-            layout = layout.with(KvLayerClass { name: "mla_dsa_shared_indexer", layers: shared, planes: vec![latent] });
+            let mut latent_only = vec![latent];
+            if let Some(r) = rot {
+                latent_only.push(r);
+            }
+            layout = layout.with(KvLayerClass { name: "mla_dsa_shared_indexer", layers: shared, planes: latent_only });
         }
         layout
     }

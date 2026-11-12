@@ -114,7 +114,8 @@ pub struct MlaDevice {
     pub kv_a_norm: DevBuf,
     /// `kv_b_proj` split and packed (`W_UK`, transposed `W_UV`).
     pub kv_b: mla::MlaWeights,
-    pub indexer: IndexerDevice,
+    /// `None` on a layer without its own indexer (the full model's shared layers; the Flash model always has one).
+    pub indexer: Option<IndexerDevice>,
 }
 
 pub enum MixerDevice {
@@ -324,8 +325,9 @@ impl Binder<'_> {
 
     /// One MLA layer's tensors (`index`: the layer's checkpoint index, for the messages).
     fn mla(&self, m: &super::weights::MlaWeights, index: usize) -> Result<MlaDevice, ModelError> {
-        let ix = m.indexer.as_ref().ok_or_else(|| cfg_err(format!("layer {index}: a shared indexer is not built")))?;
-        let kp = ix.kpool.as_ref().ok_or_else(|| cfg_err(format!("layer {index}: the indexer has no k-pool tensors")))?;
+        // the Flash model's indexer (an EXL3/plain wq_b, wk, weights_proj, the key LayerNorm and the k-pool); a shared layer's is absent, and
+        // the full model's indexer has no k-pool (its DSA path is not ported), so neither is placed here yet
+        let ix = m.indexer.as_ref().filter(|ix| ix.kpool.is_some());
         // `kv_b` is the packed copy: `uk` first (64 x 256 x 512 fp16), then `uvt` (64 x 512 x 256 fp16)
         let kvb = self.plain(&m.kv_b_proj)?;
         let half = kvb.bytes() / 2;
@@ -337,20 +339,26 @@ impl Binder<'_> {
             q_a_norm: self.plain(&m.q_a_layernorm)?,
             kv_a_norm: self.plain(&m.kv_a_layernorm)?,
             kv_b: mla::MlaWeights { uk: kvb.subview(0, half), uvt: kvb.subview(half, half), dtype: Dtype::F16 },
-            indexer: IndexerDevice {
-                wq_b: match &ix.wq_b {
-                    IndexerWqB::Exl3(g) => WqBDevice::Exl3(self.exl3(g)?),
-                    IndexerWqB::PlainF16(t) => WqBDevice::F16 { w: self.plain(t)?, k: t.shape[1], n: t.shape[0] },
-                },
-                wk: self.plain(&ix.wk)?,
-                weights_proj: self.plain(&ix.weights_proj)?,
-                compress_gate: self.plain(&kp.compress_gate)?,
-                dsa: dsa::IndexerWeights {
-                    ln_w: self.plain(&ix.k_norm_weight)?,
-                    ln_b: self.plain(&ix.k_norm_bias)?,
-                    ape: self.plain(&kp.compress_ape)?,
-                    eps: dsa::LN_EPS,
-                },
+            indexer: match ix {
+                Some(ix) => {
+                    let kp = ix.kpool.as_ref().expect("checked above");
+                    Some(IndexerDevice {
+                        wq_b: match &ix.wq_b {
+                            IndexerWqB::Exl3(g) => WqBDevice::Exl3(self.exl3(g)?),
+                            IndexerWqB::PlainF16(t) => WqBDevice::F16 { w: self.plain(t)?, k: t.shape[1], n: t.shape[0] },
+                        },
+                        wk: self.plain(&ix.wk)?,
+                        weights_proj: self.plain(&ix.weights_proj)?,
+                        compress_gate: self.plain(&kp.compress_gate)?,
+                        dsa: dsa::IndexerWeights {
+                            ln_w: self.plain(&ix.k_norm_weight)?,
+                            ln_b: self.plain(&ix.k_norm_bias)?,
+                            ape: self.plain(&kp.compress_ape)?,
+                            eps: dsa::LN_EPS,
+                        },
+                    })
+                }
+                None => None,
             },
         })
     }
@@ -380,7 +388,14 @@ impl Binder<'_> {
     }
 
     fn layer(&self, l: &GlmLayerWeights, limit: f32) -> Result<LayerDevice, ModelError> {
-        let mhc = l.mhc.as_ref().ok_or_else(|| cfg_err(format!("layer {} has no mHC weights", l.index)))?;
+        // a plain-residual layer (the full model) has no hyper-connection tensors: its sites are never read
+        let (attn_site, ffn_site) = match l.mhc.as_ref() {
+            Some(mhc) => (self.site(&mhc.attn)?, self.site(&mhc.ffn)?),
+            None => (
+                MhcSite::empty().map_err(|e| cfg_err(format!("layer {}: {e}", l.index)))?,
+                MhcSite::empty().map_err(|e| cfg_err(format!("layer {}: {e}", l.index)))?,
+            ),
+        };
         let mixer = match &l.mixer {
             MixerWeights::Kda(k) => MixerDevice::Kda(Box::new(KdaDevice {
                 qkv: self.exl3(&k.qkv_proj)?,
@@ -406,8 +421,8 @@ impl Binder<'_> {
             index: l.index,
             input_norm: self.plain(&l.input_layernorm)?,
             post_norm: self.plain(&l.post_attention_layernorm)?,
-            attn_site: self.site(&mhc.attn)?,
-            ffn_site: self.site(&mhc.ffn)?,
+            attn_site,
+            ffn_site,
             mixer,
             ffn,
         })

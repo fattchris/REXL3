@@ -33,6 +33,7 @@ use gb_cuda::{dsa, glm_glue, glue, kda, DevBuf, Stream};
 use std::collections::BTreeMap;
 
 pub mod graphs;
+mod plain;
 mod layers;
 pub mod mtp;
 pub mod snapshot;
@@ -124,6 +125,8 @@ struct Scratch {
     kv_a: DevBuf,
     ckv: DevBuf,
     mla_out: DevBuf,
+    /// `[rows][64][64]`: the rotated rope queries of an MLA with a rotary tail (empty without one).
+    qrot: DevBuf,
     k_raw: DevBuf,
     gate: DevBuf,
     wproj: DevBuf,
@@ -264,6 +267,9 @@ pub struct GlmModel {
     kv_tab: KvTables,
     table: BlockTable,
     s: Scratch,
+    /// The rotary tables of an MLA with a rotary tail (`[max_context + 1][32]` fp32); `None` for the NoPE model.
+    cos: Option<DevBuf>,
+    sin: Option<DevBuf>,
     sig: SigmoidTable,
     kda_dims: kda::Dims,
     kda_params: kda::Params,
@@ -387,10 +393,18 @@ impl GlmModel {
         }
         let mut latent = Vec::new();
         let mut planes = Vec::new();
+        let rope = cfg.mla.qk_rope_head_dim > 0;
         for _ in &mla_layers {
-            latent.push(LatentCache::new(o.kv_blocks, Dtype::F16)?);
+            latent.push(if rope { LatentCache::new_rope(o.kv_blocks, Dtype::F16)? } else { LatentCache::new(o.kv_blocks, Dtype::F16)? });
             planes.push(dsa::Planes::new(o.kv_blocks, o.slots, RING_LEN)?);
         }
+        // the rotary tables, one row per position of the served window
+        let (cos, sin) = if rope {
+            let (c, s) = mla::rope_tables(o.max_context + 1, cfg.rope_theta as f32);
+            (Some(DevBuf::from_slice(&c)?), Some(DevBuf::from_slice(&s)?))
+        } else {
+            (None, None)
+        };
         let moe_dims = alloc::moe_dims(&cfg);
         let shared_inter = cfg.ffn.moe_intermediate * cfg.ffn.shared_experts;
         // the shared expert's shapes size its scratch: the first MoE layer's, or the NextN layer's for a model whose trunk prefix has none
@@ -412,6 +426,12 @@ impl GlmModel {
         let ix = &cfg.indexer;
         let ch = cfg.kda.heads * cfg.kda.head_dim;
         let zv = DevBuf::zeroed_view;
+        // the kv_a GEMM's output width: the latent plus the rope tail, padded to whole 128-column strips (576 -> 640 in our pack)
+        let kv_n = if m.qk_rope_head_dim > 0 {
+            (m.kv_lora_rank + m.qk_rope_head_dim).next_multiple_of(128)
+        } else {
+            m.kv_lora_rank
+        };
         let s = Scratch {
             rows: cr,
             ids: zeroed(cr * 4)?,
@@ -430,9 +450,10 @@ impl GlmModel {
             q_a: zeroed(cr * m.q_lora_rank * 2)?,
             q_resid: zeroed(cr * m.q_lora_rank * 2)?,
             q: zv(cr * m.heads * m.qk_head_dim() * 2)?,
-            kv_a: zeroed(cr * m.kv_lora_rank * 2)?,
+            kv_a: zeroed(cr * kv_n * 2)?,
             ckv: zeroed(cr * m.kv_lora_rank * 2)?,
             mla_out: zv(cr * m.heads * m.v_head_dim * 2)?,
+            qrot: zv(cr * m.heads * m.qk_rope_head_dim.max(1) * 2)?,
             k_raw: zv(cr * ix.head_dim * 2)?,
             gate: zv(cr * ix.head_dim * 2)?,
             wproj: zv(cr * ix.heads * 2)?,
@@ -450,7 +471,7 @@ impl GlmModel {
             },
             moe_shared_out: zv(cr * h * 4)?,
             ws: zeroed(exl3_ws)?,
-            ws_s1: zeroed(linear_workspace_bytes(r, h, m.kv_lora_rank + m.qk_rope_head_dim, 2))?,
+            ws_s1: zeroed(linear_workspace_bytes(r, h, alloc::kv_a_n(&cfg), 2))?,
             ws_s2: zeroed(linear_workspace_bytes(r, m.q_lora_rank, ix.heads * ix.head_dim, 2))?,
             // a view of a block of its own: the lm_head's vocabulary halves of a split rank are its two ranges (`model/tp.rs`)
             logits: zv(r * cfg.vocab * 2)?,
@@ -530,6 +551,8 @@ impl GlmModel {
             slices: crate::families::glm::profile_slices::SliceProfiler::from_env()?,
             cfg,
             dev,
+            cos,
+            sin,
         };
         // the process's contract (P1 unless REXL3_GLM_PREFILL_CONTRACT says otherwise); P2 is checked against the weights and the scratch here,
         // before any chunk can run it
@@ -984,6 +1007,10 @@ impl GlmModel {
             self.upload_rows(b)?;
         }
         self.ensure_pages(b, stale != Some(GraphMutant::StaleTable))?;
+        // the full model's plain-residual trunk: its own forward, no op schedule or window commits
+        if self.plain_trunk() {
+            return self.forward_plain(b, head, max_pos);
+        }
         let plan = match self.mutant {
             Some(m) => ops::plan_forward_mutated(&self.cfg, self.layers, head != Head::None, m),
             // the drafter taps the head's mean and norm for every row, with or without logits
@@ -1442,7 +1469,7 @@ impl GlmModel {
                             // (`done2`); the scoring needs the pool plane (`c`) and `wq_b` needs `q_resid` (`q`); every branch is joined before `expand`.
                             let sd = side.unwrap();
                             let ord = mla_ord[layer];
-                            let ix = &w.indexer;
+                            let ix = w.indexer.as_ref().ok_or_else(|| ModelError::Config("the layer has no indexer".into()))?;
                             // a rank of an MLA head split (lane E Phase 2): the query, the attention and the expand on its heads, the o_proj by
                             // K-split partials (`model/tp.rs`); the latent and the indexer as on one node
                             let mh = tp.as_ref().and_then(|t| t.mla_heads());

@@ -201,19 +201,6 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     let ck = gb_exl3::checkpoint::scan(&o.model_dir, false).map_err(|e| ModelError::Pack(PackError::Io(e.to_string())))?;
     // `--no-vision` claims and skips the tower: the text model maps (and serves) whatever the tower's format
     let pack = GlmPack::from_checkpoint_with(&ck, cfg.clone(), o.vision.is_some())?;
-    // the full GLM-5.3 pack (`glm_moe_dsa`): its MLA carries a 64-wide rotary tail and its trunk residuals are plain, and the Flash forward
-    // implements neither. Refuse by name instead of serving the wrong arithmetic.
-    if cfg.mla.qk_rope_head_dim > 0 {
-        return Err(ModelError::Config(format!(
-            "GLM-5.3 full: the MLA rotary tail (qk_rope_head_dim {}) is not implemented in this engine (the GLM forward is NoPE-only)",
-            cfg.mla.qk_rope_head_dim
-        )));
-    }
-    if cfg.layers.iter().any(|l| l.residual == crate::family::Residual::Plain) {
-        return Err(ModelError::Config(
-            "GLM-5.3 full: the trunk's plain residual is not implemented in this engine (every Flash trunk layer joins through mHC)".into(),
-        ));
-    }
     // the NextN layer's input fusion: an EXL3 group in the Flash pack, a plain fp16 matrix in the full pack. The drafter runs only the
     // EXL3 form; a plain one refuses here instead of at the first draft.
     if with_mtp && pack.weights.mtp.iter().any(|m| matches!(m.eh_proj, super::weights::MtpEhProj::PlainF16(_))) {
@@ -233,7 +220,8 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     boot::mark("cuda_ready", None);
     crate::serve::boot_checkpoint()?;
 
-    let layers = cfg.layers.len();
+    // dev knob for the port's smoke tests: load and run only the first layers (the weights beyond them stay unread)
+    let layers = std::env::var("REXL3_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(cfg.layers.len()).min(cfg.layers.len());
     let lo = LoadOptions::from_env(o.floor_bytes);
     loadstats::set_component(Component::Target);
     boot::mark("target_loading", None);
@@ -417,8 +405,17 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     }
     loadstats::phase_end(ph);
     // the plan the admission was priced with is what was allocated: say so loudly if it is not (a bug in the memory model, never a property of the pack)
+    // the dev layer limit runs a prefix of the trunk: the plan it is checked against is that prefix's
+    let plan_cfg = if layers < cfg.layers.len() {
+        let mut c = cfg.clone();
+        c.layers.truncate(layers);
+        c.mtp.clear();
+        c
+    } else {
+        cfg.clone()
+    };
     let ap = AllocPlan::new_chunked(
-        &cfg,
+        &plan_cfg,
         &AllocParams {
             slots,
             kv_blocks: pool_blocks,

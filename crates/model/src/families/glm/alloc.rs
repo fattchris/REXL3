@@ -173,6 +173,16 @@ pub fn moe_dims(cfg: &GlmConfig) -> MoeDims {
     }
 }
 
+/// The kv_a_proj GEMM's stored output width: the latent plus the rope tail, padded to whole 128-column strips in the pack.
+pub fn kv_a_n(cfg: &GlmConfig) -> usize {
+    let m = &cfg.mla;
+    if m.qk_rope_head_dim > 0 {
+        (m.kv_lora_rank + m.qk_rope_head_dim).next_multiple_of(128)
+    } else {
+        m.kv_lora_rank
+    }
+}
+
 /// The EXL3 linear shapes (K, N) of the text model: the largest decode workspace over them serves every layer on a stream.
 pub fn exl3_shapes(cfg: &GlmConfig) -> Vec<(usize, usize)> {
     let h = cfg.hidden;
@@ -181,7 +191,7 @@ pub fn exl3_shapes(cfg: &GlmConfig) -> Vec<(usize, usize)> {
     let mut v = vec![
         (h, m.q_lora_rank),                                        // q_a_proj
         (m.q_lora_rank, m.heads * m.qk_head_dim()),                // q_b_proj
-        (h, m.kv_lora_rank + m.qk_rope_head_dim),                  // kv_a_proj_with_mqa
+        (h, kv_a_n(cfg)),                                          // kv_a_proj_with_mqa (stored width: 640 with a rope tail)
         (m.heads * m.v_head_dim, h),                               // mla o_proj
         (m.q_lora_rank, cfg.indexer.heads * cfg.indexer.head_dim), // indexer wq_b
         (h, cfg.ffn.dense_intermediate),                           // dense gate, up
@@ -316,7 +326,12 @@ impl AllocPlan {
             };
             dec.max(big) as u64
         };
-        let mla_acts = (m.q_lora_rank * 2 + m.heads * m.qk_head_dim() + m.kv_lora_rank * 2 + m.heads * m.v_head_dim) as u64 * 2;
+        let mla_acts = (m.q_lora_rank * 2
+            + m.heads * m.qk_head_dim()
+            + m.kv_lora_rank * 2
+            + m.heads * m.v_head_dim
+            + m.heads * m.qk_rope_head_dim) as u64
+            * 2;
         let ix_acts = (2 * ix.head_dim + ix.heads + ix.heads * ix.head_dim) as u64 * 2;
         let ch = (cfg.kda.heads * cfg.kda.head_dim) as u64;
         let sc = |name, bytes: u64| Item { name, bytes };
@@ -346,7 +361,7 @@ impl AllocPlan {
             // the two side streams' (`model/graphs.rs`): `kv_a` and the indexer's `wq_b`
             sc(
                 "exl3_workspace_side",
-                (linear_workspace_bytes(rows, cfg.hidden, m.kv_lora_rank + m.qk_rope_head_dim, 2)
+                (linear_workspace_bytes(rows, cfg.hidden, kv_a_n(cfg), 2)
                     + linear_workspace_bytes(rows, m.q_lora_rank, ix.heads * ix.head_dim, 2)) as u64,
             ),
             sc("logits", r * cfg.vocab as u64 * 2),

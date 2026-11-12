@@ -364,16 +364,11 @@ impl<'a> Binder<'a> {
         // plain 16-bit, not EXL3; the kernels read it split per head and packed (W_UK, transposed W_UV). An fp16 pack is packed as stored;
         // a bf16 pack is converted to fp16 first (the packers and kernels are fp16).
         let kv_b_name = format!("{a}kv_b_proj.weight");
+        let full = self.cfg.mla.qk_rope_head_dim > 0;
+        let (x_f16, x_bf16) = if full { (Xform::PackKvBFull, Xform::PackKvBFullBf16) } else { (Xform::PackKvB, Xform::PackKvBBf16) };
         let kv_b_proj = match self.inv.plain.get(&kv_b_name).map(|t| t.dtype.as_str()) {
-            Some("BF16") => self.plain_x(
-                &kv_b_name,
-                PlainDtype::Bf16,
-                &[heads * (nope + v), kv_rank],
-                Xform::PackKvBBf16,
-                region,
-                cat,
-            ),
-            _ => self.plain_x(&kv_b_name, F16, &[heads * (nope + v), kv_rank], Xform::PackKvB, region, cat),
+            Some("BF16") => self.plain_x(&kv_b_name, PlainDtype::Bf16, &[heads * (nope + v), kv_rank], x_bf16, region, cat),
+            _ => self.plain_x(&kv_b_name, F16, &[heads * (nope + v), kv_rank], x_f16, region, cat),
         };
         let o_proj = self.group(&format!("{a}o_proj"), heads * v, h, Some(region), cat);
         let indexer = match indexer {
