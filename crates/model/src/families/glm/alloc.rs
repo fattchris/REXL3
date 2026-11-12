@@ -132,6 +132,10 @@ pub struct AllocPlan {
 
 pub(super) fn dims_of(cfg: &GlmConfig) -> Result<Dims, String> {
     let d = Dims::glm();
+    // a pack with no KDA layer (the full GLM-5.3) never touches the KDA kernels: their shape checks do not apply
+    if cfg.kda_layers().is_empty() {
+        return Ok(d);
+    }
     if cfg.kda.heads != d.heads
         || cfg.kda.head_dim != kda::HEAD_DIM
         || cfg.hidden != d.hidden
@@ -175,8 +179,6 @@ pub fn exl3_shapes(cfg: &GlmConfig) -> Vec<(usize, usize)> {
     let m = &cfg.mla;
     let kda_ch = cfg.kda.heads * cfg.kda.head_dim;
     let mut v = vec![
-        (h, 3 * kda_ch),                                           // kda qkv_proj
-        (kda_ch, h),                                               // kda o_proj
         (h, m.q_lora_rank),                                        // q_a_proj
         (m.q_lora_rank, m.heads * m.qk_head_dim()),                // q_b_proj
         (h, m.kv_lora_rank + m.qk_rope_head_dim),                  // kv_a_proj_with_mqa
@@ -188,6 +190,10 @@ pub fn exl3_shapes(cfg: &GlmConfig) -> Vec<(usize, usize)> {
         (cfg.ffn.moe_intermediate * cfg.ffn.shared_experts, h),    // shared down
         (h, cfg.vocab),                                            // lm_head
     ];
+    if kda_ch > 0 {
+        v.push((h, 3 * kda_ch)); // kda qkv_proj
+        v.push((kda_ch, h));     // kda o_proj
+    }
     v.sort_unstable();
     v.dedup();
     v

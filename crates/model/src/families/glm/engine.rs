@@ -201,6 +201,19 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     let ck = gb_exl3::checkpoint::scan(&o.model_dir, false).map_err(|e| ModelError::Pack(PackError::Io(e.to_string())))?;
     // `--no-vision` claims and skips the tower: the text model maps (and serves) whatever the tower's format
     let pack = GlmPack::from_checkpoint_with(&ck, cfg.clone(), o.vision.is_some())?;
+    // the full GLM-5.3 pack (`glm_moe_dsa`): its MLA carries a 64-wide rotary tail and its trunk residuals are plain, and the Flash forward
+    // implements neither. Refuse by name instead of serving the wrong arithmetic.
+    if cfg.mla.qk_rope_head_dim > 0 {
+        return Err(ModelError::Config(format!(
+            "GLM-5.3 full: the MLA rotary tail (qk_rope_head_dim {}) is not implemented in this engine (the GLM forward is NoPE-only)",
+            cfg.mla.qk_rope_head_dim
+        )));
+    }
+    if cfg.layers.iter().any(|l| l.residual == crate::family::Residual::Plain) {
+        return Err(ModelError::Config(
+            "GLM-5.3 full: the trunk's plain residual is not implemented in this engine (every Flash trunk layer joins through mHC)".into(),
+        ));
+    }
     let scan_s = t.elapsed().as_secs_f64();
     boot::mark("packs_scanned", None);
     let target_fingerprint = check_pack(&ck, o.allow_unvalidated_pack)?;

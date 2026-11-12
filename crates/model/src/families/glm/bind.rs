@@ -18,8 +18,6 @@ use crate::family::{Ffn, IndexerMode, LayerSpec, Mixer, Residual};
 use gb_exl3::budget::Category;
 use std::collections::BTreeSet;
 
-const P: &str = "model.language_model.";
-
 /// One reason a pack does not map onto the family's weights.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {
@@ -197,6 +195,18 @@ impl<'a> Binder<'a> {
         self.group_with(prefix, k, n, region, category, false)
     }
 
+    /// [`Binder::group`] for a group a pack may store padded up to whole 128-column strips: `kv_a_proj_with_mqa` holds the latent and the
+    /// rotary key (576 columns) and EXL3 pads it to 640. The stored width is kept (the kernels read the first `n_min` columns); a width
+    /// below `n_min` or past the next strip boundary is the shape problem.
+    fn group_padded(&mut self, prefix: &str, k: usize, n_min: usize, region: Option<RegionId>, category: Category) -> Exl3Linear {
+        let n_max = n_min.next_multiple_of(128);
+        let stored = self.inv.groups.get(prefix).map(|g| g.n);
+        match stored {
+            Some(n) if n == n_min || (n > n_min && n <= n_max && n % 128 == 0) => self.group(prefix, k, n, region, category),
+            _ => self.group(prefix, k, n_min, region, category),
+        }
+    }
+
     /// [`Binder::group`], and with `allow_bias` a group that has a `.bias` is taken (the caller claims and places the bias: `group_bias`).
     /// The text model's kernels have no bias input, so only the vision tower allows one.
     fn group_with(
@@ -341,7 +351,7 @@ impl<'a> Binder<'a> {
         let q_a_proj = self.group(&format!("{a}q_a_proj"), h, q_rank, Some(region), cat);
         let q_a_layernorm = self.plain_x(&format!("{a}q_a_layernorm.weight"), Bf16, &[q_rank], Xform::Bf16ToF32, region, cat);
         let q_b_proj = self.group(&format!("{a}q_b_proj"), q_rank, heads * qk, Some(region), cat);
-        let kv_a_proj_with_mqa = self.group(&format!("{a}kv_a_proj_with_mqa"), h, kv_rank + rope, Some(region), cat);
+        let kv_a_proj_with_mqa = self.group_padded(&format!("{a}kv_a_proj_with_mqa"), h, kv_rank + rope, Some(region), cat);
         let kv_a_layernorm = self.plain_x(&format!("{a}kv_a_layernorm.weight"), Bf16, &[kv_rank], Xform::Bf16ToF32, region, cat);
         // plain fp16, not EXL3 and not bf16; the kernels read it split per head and packed (W_UK, transposed W_UV)
         let kv_b_proj =
@@ -545,7 +555,7 @@ impl<'a> Binder<'a> {
     ) -> Option<GlmLayerWeights> {
         let (h, ffn_cfg) = (self.cfg.hidden, &self.cfg.ffn);
         let (inter, shared_n, dense_inter) = (ffn_cfg.moe_intermediate, ffn_cfg.shared_experts, ffn_cfg.dense_intermediate);
-        let l = format!("{P}layers.{index}.");
+        let l = format!("{}layers.{index}.", self.cfg.text_prefix);
         let input_layernorm =
             self.plain_x(&format!("{l}input_layernorm.weight"), PlainDtype::Bf16, &[h], Xform::Bf16ToF32, region, trunk);
         let post_attention_layernorm =
@@ -881,9 +891,9 @@ impl GlmWeights {
 
         let global = b.region(RegionKind::Global);
         let embed_tokens =
-            b.plain(&format!("{P}embed_tokens.weight"), PlainDtype::Bf16, &[cfg.vocab, cfg.hidden], global, Category::Embedding);
+            b.plain(&format!("{}embed_tokens.weight", cfg.text_prefix), PlainDtype::Bf16, &[cfg.vocab, cfg.hidden], global, Category::Embedding);
         let final_norm =
-            b.plain_x(&format!("{P}norm.weight"), PlainDtype::Bf16, &[cfg.hidden], Xform::Bf16ToF32, global, Category::Other);
+            b.plain_x(&format!("{}norm.weight", cfg.text_prefix), PlainDtype::Bf16, &[cfg.hidden], Xform::Bf16ToF32, global, Category::Other);
         let lm_head = b.group("lm_head", cfg.hidden, cfg.vocab, Some(global), Category::Head);
 
         let mut layers = Vec::with_capacity(cfg.layers.len());
@@ -895,7 +905,7 @@ impl GlmWeights {
         for (j, spec) in cfg.mtp.iter().enumerate() {
             let index = cfg.mtp_layer_index(j);
             let region = b.region(RegionKind::Trunk(index));
-            let l = format!("{P}layers.{index}.");
+            let l = format!("{}layers.{index}.", cfg.text_prefix);
             let h = cfg.hidden;
             let eh_proj = b.group(&format!("{l}eh_proj"), 2 * h, h, Some(region), Category::Mtp);
             let enorm = b.plain_x(&format!("{l}enorm.weight"), PlainDtype::Bf16, &[h], Xform::Bf16ToF32, region, Category::Mtp);

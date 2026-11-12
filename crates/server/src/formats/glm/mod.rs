@@ -17,7 +17,7 @@ use vision::GlmImageGeometry;
 /// The GLM image placeholder the template renders once per image part, between `<|begin_of_image|>` and `<|end_of_image|>`.
 pub const IMAGE_TOKEN: &str = "<|image|>";
 
-pub const ENTRY: FormatEntry = FormatEntry { id: "glm5_next", names: &["Glm5NextForConditionalGeneration", "glm5_next"], open };
+pub const ENTRY: FormatEntry = FormatEntry { id: "glm5_next", names: &["Glm5NextForConditionalGeneration", "glm5_next", "GlmMoeDsaForCausalLM", "glm_moe_dsa"], open };
 
 fn open(dir: &Path) -> Result<Box<dyn ChatFormat>, String> {
     let src = std::fs::read_to_string(dir.join("chat_template.jinja")).map_err(|e| format!("chat_template.jinja: {e}"))?;
