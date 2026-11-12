@@ -80,13 +80,14 @@ fn the_indexer_kernels_match_the_host_reference() {
         let x: Vec<f32> = (0..D).map(|d| dec(dt, kraw_h[row * D + d])).collect();
         let mean: f32 = x.iter().sum::<f32>() / D as f32;
         let var: f32 = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / D as f32;
-        let mut y: Vec<f32> = (0..D)
+        let norm: Vec<f32> = (0..D)
             .map(|d| (x[d] - mean) / (var + glm_idx::LN_EPS).sqrt() * dec(dt, lnw_h[d]) + dec(dt, lnb_h[d]))
             .collect();
+        let mut y = norm.clone();
         let p = pos[row] as usize;
         let hh = ROPE / 2;
         for i in 0..hh {
-            let (x0, x1) = (y[2 * i], y[2 * i + 1]);
+            let (x0, x1) = (norm[2 * i], norm[2 * i + 1]);
             let c = cos_h[p * hh + i];
             let s = sin_h[p * hh + i];
             y[i] = x0 * c - x1 * s;
@@ -106,26 +107,26 @@ fn the_indexer_kernels_match_the_host_reference() {
             }
             q_ref[row][h * D..(h + 1) * D].copy_from_slice(&out);
         }
-        // score
-        for t in 0..=p {
-            let mut total = 0.0f32;
-            for h in 0..H {
-                let mut dot = 0.0f32;
-                for d in 0..D {
-                    dot += q_ref[row][h * D + d] * keys_ref[base + d];
-                }
-                total += (dot * (D as f32).sqrt().recip()).max(0.0) * dec(dt, w_h[row * H + h]);
-            }
-            total *= (H as f32).sqrt().recip();
-            let got = scores_v[row * max_pos + t];
-            assert!((got - total).abs() < 5e-3 + 5e-3 * total.abs(), "score[{row}][{t}] {got} vs {total}");
-        }
         // key / q outputs
         for d in (0..D).step_by(11) {
             let got = dec(dt, keys_out[base + d]);
             assert!((got - keys_ref[base + d]).abs() < 2e-2 + 2e-2 * keys_ref[base + d].abs(), "key[{row}][{d}]");
             let gotq = dec(dt, qout_v[row * H * D + d]);
             assert!((gotq - q_ref[row][d]).abs() < 5e-3 + 5e-3 * q_ref[row][d].abs(), "q[{row}][{d}]");
+        }
+        // score
+        for t in 0..=p {
+            let mut total = 0.0f32;
+            for h in 0..H {
+                let mut dot = 0.0f32;
+                for d in 0..D {
+                    dot += q_ref[row][h * D + d] * keys_ref[t * D + d];
+                }
+                total += (dot * (D as f32).sqrt().recip()).max(0.0) * dec(dt, w_h[row * H + h]);
+            }
+            total *= (H as f32).sqrt().recip();
+            let got = scores_v[row * max_pos + t];
+            assert!((got - total).abs() < 5e-3 + 5e-3 * total.abs(), "score[{row}][{t}] {got} vs {total}");
         }
     }
     // selection: row 1 (pos 3) selects 2 of 4 keys by (score desc, lower position), ascending
