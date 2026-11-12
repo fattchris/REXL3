@@ -68,9 +68,9 @@ __device__ __forceinline__ float block_sum(float v, float* sm) {
 
 constexpr int RMS_NT = 256;
 
-__global__ void __launch_bounds__(RMS_NT) rmsnorm_f16_k(const u16* x, const float* w, u16* y, int dim, float eps) {
+__global__ void __launch_bounds__(RMS_NT) rmsnorm_f16_k(const u16* x, int x_stride, const float* w, u16* y, int dim, float eps) {
     __shared__ float sm[RMS_NT / 32];
-    const size_t base = (size_t)blockIdx.x * dim;
+    const size_t base = (size_t)blockIdx.x * x_stride;
     const int nvec = dim / 8;
     float ss = 0.f;
     for (int v = threadIdx.x; v < nvec; v += RMS_NT) {
@@ -283,11 +283,19 @@ int launch_topk(const void* logits, int rows, int stride, int valid, int count, 
 
 // y = f16((x * (1 / sqrtf(mean(x^2) + eps))) * w) per row; x, y fp16 [rows, dim] (y may alias x), w fp32 [dim]. dim % 8 == 0 and
 // 16-byte aligned pointers, or cudaErrorInvalidValue.
+GB_EXPORT int gb_glm_rmsnorm_f16_strided(const void* x, int x_stride, const void* w, void* y, int rows, int dim, float eps,
+                                       void* stream) {
+    if (rows < 0 || dim <= 0 || x_stride < dim) return (int)cudaErrorInvalidValue;
+    if (rows == 0) return 0;
+    rmsnorm_f16_k<<<rows, RMS_NT, 0, gb_stream(stream)>>>((const u16*)x, x_stride, (const float*)w, (u16*)y, dim, eps);
+    return GB_CHECK_LAUNCH();
+}
+
 GB_EXPORT int gb_glm_rmsnorm_f16(const void* x, const void* w, void* y, int rows, int dim, float eps, void* stream) {
     if (rows < 0 || dim < 8 || dim % 8 != 0) return ERR_INVALID;
     if (rows == 0) return 0;
     if (!x || !w || !y || !aligned16(x) || !aligned16(w) || !aligned16(y)) return ERR_INVALID;
-    rmsnorm_f16_k<<<rows, RMS_NT, 0, gb_stream(stream)>>>((const u16*)x, (const float*)w, (u16*)y, dim, eps);
+    rmsnorm_f16_k<<<rows, RMS_NT, 0, gb_stream(stream)>>>((const u16*)x, dim, (const float*)w, (u16*)y, dim, eps);
     return GB_CHECK_LAUNCH();
 }
 
