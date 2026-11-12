@@ -447,7 +447,7 @@ impl GlmModel {
         };
         let s = Scratch {
             rows: cr,
-            ids: zeroed(cr * 4)?,
+            ids: zv(cr * 4)?,
             rowidx: RowIndex { slot: zv(cr * 4)?, pos: zv(cr * 4)?, rows: cr },
             seq_start: zeroed((cr + 1) * 4)?,
             seq_slot: zeroed(cr * 4)?,
