@@ -127,6 +127,11 @@ struct Scratch {
     mla_out: DevBuf,
     /// `[rows][64][64]`: the rotated rope queries of an MLA with a rotary tail (empty without one).
     qrot: DevBuf,
+    /// The full model's indexer per-call buffers: the roped queries, scores f32 `[rows][max_context + 1]`, the selection.
+    idx_q: DevBuf,
+    idx_scores: DevBuf,
+    idx_sel: DevBuf,
+    idx_meta: DevBuf,
     k_raw: DevBuf,
     gate: DevBuf,
     wproj: DevBuf,
@@ -270,6 +275,8 @@ pub struct GlmModel {
     /// The rotary tables of an MLA with a rotary tail (`[max_context + 1][32]` fp32); `None` for the NoPE model.
     cos: Option<DevBuf>,
     sin: Option<DevBuf>,
+    /// The full model's per-token indexer key planes, one per MLA layer that computes its own selection (`None` on shared layers).
+    idx_keys: Vec<Option<DevBuf>>,
     sig: SigmoidTable,
     kda_dims: kda::Dims,
     kda_params: kda::Params,
@@ -398,6 +405,12 @@ impl GlmModel {
             latent.push(if rope { LatentCache::new_rope(o.kv_blocks, Dtype::F16)? } else { LatentCache::new(o.kv_blocks, Dtype::F16)? });
             planes.push(dsa::Planes::new(o.kv_blocks, o.slots, RING_LEN)?);
         }
+        // the full model's indexer key planes: [blocks][256][128] f16 per layer that computes its own selection
+        let mut idx_keys = Vec::with_capacity(mla_layers.len());
+        for &l in &mla_layers {
+            let has = matches!(&dev.layers[l].mixer, MixerDevice::Mla(m) if m.full_indexer.is_some());
+            idx_keys.push(if has { Some(DevBuf::alloc(o.kv_blocks * 256 * 128 * 2)?) } else { None });
+        }
         // the rotary tables, one row per position of the served window
         let (cos, sin) = if rope {
             let (c, s) = mla::rope_tables(o.max_context + 1, cfg.rope_theta as f32);
@@ -454,6 +467,10 @@ impl GlmModel {
             ckv: zeroed(cr * m.kv_lora_rank * 2)?,
             mla_out: zv(cr * m.heads * m.v_head_dim * 2)?,
             qrot: zv(cr * m.heads * m.qk_rope_head_dim.max(1) * 2)?,
+            idx_q: zv(cr * gb_cuda::glm_idx::H * gb_cuda::glm_idx::D * 2)?,
+            idx_scores: zeroed(cr * (o.max_context + 1) * 4)?,
+            idx_sel: zv(cr * gb_cuda::glm_idx::K_STRIDE * 4)?,
+            idx_meta: zv(cr * 2 * 4)?,
             k_raw: zv(cr * ix.head_dim * 2)?,
             gate: zv(cr * ix.head_dim * 2)?,
             wproj: zv(cr * ix.heads * 2)?,
@@ -553,6 +570,7 @@ impl GlmModel {
             dev,
             cos,
             sin,
+            idx_keys,
         };
         // the process's contract (P1 unless REXL3_GLM_PREFILL_CONTRACT says otherwise); P2 is checked against the weights and the scratch here,
         // before any chunk can run it

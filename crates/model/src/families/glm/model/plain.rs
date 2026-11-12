@@ -5,9 +5,12 @@
 //! cache, shared selections), which is not ported yet, so such a call is refused by name.
 
 use super::*;
-use crate::families::glm::device::{FfnDevice, MixerDevice};
+use crate::families::glm::device::{FfnDevice, FullIndexerDevice, MixerDevice};
 use crate::families::glm::model::layers;
 use gb_cuda::mla::{self, LatentCache};
+
+/// Row stride of the full model's selection indices (`gb_cuda::glm_idx::K_STRIDE`).
+pub(super) const K_STRIDE: usize = gb_cuda::glm_idx::K_STRIDE;
 
 impl GlmModel {
     /// A config whose trunk joins through plain residuals (the full model): the mHC op schedule, KDA and the window commits do not apply.
@@ -16,7 +19,7 @@ impl GlmModel {
     }
 
     pub(super) fn forward_plain(&mut self, b: &RowBatch, head: Head, max_pos: usize) -> Result<(), ModelError> {
-        let GlmModel { cfg, dev, stream, s, latent, mla_ord, table, cos, sin, sig, .. } = self;
+        let GlmModel { cfg, dev, stream, s, latent, mla_ord, table, cos, sin, sig, idx_keys, .. } = self;
         let st = &*stream;
         let h = cfg.hidden;
         let rows = b.rows;
@@ -35,7 +38,11 @@ impl GlmModel {
                     return Err(ModelError::Config("the full model's trunk has MLA layers only".into()));
                 };
                 let ord = mla_ord[l];
-                mixer_rope(cfg, w, &mut latent[ord], s, table, &ri, n, max_pos, cos, sin, st)?;
+                let idx = match (&w.full_indexer, &mut idx_keys[ord]) {
+                    (Some(ix), Some(plane)) => Some((ix, &mut *plane)),
+                    _ => None,
+                };
+                mixer_rope(cfg, w, idx, &mut latent[ord], s, table, &ri, n, max_pos, cos, sin, st)?;
                 gb_cuda::glm_mtp::add_rmsnorm_f32(&mut x, &s.mixer_out, &layer.post_norm, &mut s.hidden, n, h, RMS_EPS, st)?;
                 match &layer.ffn {
                     FfnDevice::Dense(m) => {
@@ -73,12 +80,14 @@ impl GlmModel {
     }
 }
 
-/// One MLA layer of the full model on dense rows: q_a -> norm -> q_b; kv_a -> the latent norm and the rope-key rotation into both cache
-/// planes; the absorbed query and rotated rope query; attention with the rope term; o_proj. Writes `s.mixer_out`.
+/// One MLA layer of the full model: q_a -> norm -> q_b; kv_a -> the latent norm and the rope-key rotation into both cache planes;
+/// on a layer that owns the indexer, the per-token keys (LayerNorm + rope) and this row's top-k selection; the absorbed and rotated
+/// query; attention (dense rows below 2,048, the selection above); o_proj. Writes `s.mixer_out`.
 #[allow(clippy::too_many_arguments)]
 fn mixer_rope(
     cfg: &GlmConfig,
     w: &crate::families::glm::device::MlaDevice,
+    idx: Option<(&FullIndexerDevice, &mut DevBuf)>,
     latent: &mut LatentCache,
     s: &mut Scratch,
     table: &BlockTable,
@@ -91,33 +100,29 @@ fn mixer_rope(
 ) -> Result<(), ModelError> {
     let h = cfg.hidden;
     let m = &cfg.mla;
-    if max_pos + 1 > mla::DENSE_MAX_KEYS {
-        return Err(ModelError::Request(format!(
-            "position {max_pos} needs the full model's DSA indexer (dense attention serves below {} tokens)",
-            mla::DENSE_MAX_KEYS
-        )));
-    }
     let qk = m.qk_head_dim();
     let kv_n = (m.kv_lora_rank + m.qk_rope_head_dim).next_multiple_of(128);
+    let sparse = max_pos + 1 > mla::DENSE_MAX_KEYS;
+    let stride = max_pos + 1;
     w.q_a.forward(&s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st)?;
     gb_cuda::glm_glue::rmsnorm_f16(&s.q_a, &w.q_a_norm, &mut s.q_resid, rows, m.q_lora_rank, RMS_EPS, st)?;
     w.q_b.forward(&s.q_resid, &mut s.q, rows, Dtype::F16, Dtype::F16, &mut s.ws, st)?;
     w.kv_a.forward(&s.hidden, &mut s.kv_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st)?;
     gb_cuda::glm_glue::rmsnorm_f16_strided(&s.kv_a, kv_n, &w.kv_a_norm, &mut s.ckv, rows, m.kv_lora_rank, RMS_EPS, st)?;
-    mla::latent_write_rope(
-        &s.ckv,
-        &s.kv_a,
-        kv_n,
-        m.kv_lora_rank,
-        cos,
-        sin,
-        mla::ROPE_DIM / 2,
-        ri,
-        table,
-        latent,
-        rows,
-        st,
-    )?;
+    mla::latent_write_rope(&s.ckv, &s.kv_a, kv_n, m.kv_lora_rank, cos, sin, mla::ROPE_DIM / 2, ri, table, latent, rows, st)?;
+    // the indexer: this layer's keys for every row, and the selection when the layer computes it (shared layers reuse the buffer)
+    if sparse {
+        if let Some((ix, plane)) = idx {
+            use gb_cuda::glm_idx;
+            moe::linear_f16(&s.hidden, Dtype::F16, &ix.wk, &mut s.k_raw, rows, h, glm_idx::D, st)?;
+            glm_idx::key(&s.k_raw, glm_idx::D, &ix.ln_w, &ix.ln_b, cos, sin, mla::ROPE_DIM / 2, ri, table, plane, Dtype::F16, rows, st)?;
+            moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, glm_idx::H, st)?;
+            ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, false)?;
+            glm_idx::query_rope(&s.iq, glm_idx::H * glm_idx::D, cos, sin, mla::ROPE_DIM / 2, ri, &mut s.idx_q, rows, st)?;
+            glm_idx::score(&s.idx_q, glm_idx::H * glm_idx::D, &s.wproj, plane, table, ri, stride, stride, &mut s.idx_scores, rows, st)?;
+            glm_idx::select(&s.idx_scores, stride, ri, glm_idx::TOPK, &mut s.idx_sel, &mut s.idx_meta, rows, st)?;
+        }
+    }
     mla::absorb_rope(
         &s.q,
         m.heads * qk,
@@ -133,9 +138,13 @@ fn mixer_rope(
         rows,
         st,
     )?;
-    let (q_lat, qrot, o_lat) = (&s.mla.q_lat, &s.qrot, &mut s.mla.o_lat);
-    mla::attend_rope(q_lat, qrot, latent, table, ri, rows, o_lat, max_pos + 1, max_pos + 1, &mut s.mla.ws, st)?;
-    let o_lat = &s.mla.o_lat;
-    w.o.forward(o_lat, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st)?;
+    if sparse {
+        mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, mla::DENSE_MAX_KEYS, stride, &mut s.mla.ws, st)?;
+        let sel = mla::SparseSel { indices: &s.idx_sel, meta: &s.idx_meta, stride: K_STRIDE };
+        mla::attend_rope_sparse(&s.mla.q_lat, &s.qrot, latent, table, ri, &sel, rows, &mut s.mla.o_lat, stride, &mut s.mla.ws, st)?;
+    } else {
+        mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, stride, stride, &mut s.mla.ws, st)?;
+    }
+    w.o.forward(&s.mla.o_lat, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st)?;
     Ok(())
 }

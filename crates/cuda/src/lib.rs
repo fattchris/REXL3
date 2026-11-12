@@ -71,6 +71,7 @@ pub mod fp4_linear;
 pub mod fp8_linear;
 pub mod gdn;
 pub mod glm_glue;
+pub mod glm_idx;
 pub mod glm_mtp;
 pub mod glm_p2;
 pub mod glm_p2_mla;
