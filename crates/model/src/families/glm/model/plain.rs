@@ -19,7 +19,7 @@ impl GlmModel {
     }
 
     pub(super) fn forward_plain(&mut self, b: &RowBatch, head: Head, max_pos: usize) -> Result<(), ModelError> {
-        let GlmModel { cfg, dev, stream, s, latent, mla_ord, table, cos, sin, sig, idx_keys, .. } = self;
+        let GlmModel { cfg, dev, stream, s, latent, mla_ord, table, cos, sin, sig, idx_keys, tp, own_s, .. } = self;
         let st = &*stream;
         let h = cfg.hidden;
         let rows = b.rows;
@@ -53,12 +53,42 @@ impl GlmModel {
                         let sc = s.shared.as_mut().ok_or_else(|| ModelError::Config("no shared-expert scratch".into()))?;
                         shared.forward(&s.hidden, Dtype::F16, n, &mut s.moe_shared_out, sc, st)?;
                         ml.route(&s.hidden, Dtype::F16, n, sig, &mut s.moe, st)?;
-                        ml.experts_picked(&s.hidden, Dtype::F16, n, Some(&s.moe_shared_out), &mut s.mixer_out, &mut s.moe, st)?;
+                        match tp.as_mut() {
+                            // a rank of the group: its owned experts, the exchange, the combine (the shared expert is replicated and added once)
+                            Some(t) => t.experts(ml, &s.hidden, n, &mut s.moe, Some(&s.moe_shared_out), &mut s.mixer_out, st, &mut || Ok(()))?,
+                            None => ml.experts_picked(
+                                &s.hidden,
+                                Dtype::F16,
+                                n,
+                                Some(&s.moe_shared_out),
+                                &mut s.mixer_out,
+                                &mut s.moe,
+                                st,
+                            )?,
+                        }
                     }
-                    FfnDevice::MoeSubbanks { .. } => {
-                        return Err(ModelError::Config(
-                            "the full model's MoE layers must bind as one expert bank on one node".into(),
-                        ))
+                    FfnDevice::MoeSubbanks { layer: ml, shared } => {
+                        let sc = s.shared.as_mut().ok_or_else(|| ModelError::Config("no shared-expert scratch".into()))?;
+                        shared.forward(&s.hidden, Dtype::F16, n, &mut s.moe_shared_out, sc, st)?;
+                        ml.route(&s.hidden, Dtype::F16, n, sig, &mut s.moe, st)?;
+                        match tp.as_mut() {
+                            Some(t) => t.subbanks(ml, &s.hidden, n, &mut s.moe, Some(&s.moe_shared_out), &mut s.mixer_out, st, &mut || Ok(()))?,
+                            None => {
+                                let os = own_s.as_mut().ok_or_else(|| ModelError::Config("no subbank scratch".into()))?;
+                                ml.experts.run_pairs(&s.hidden, Dtype::F16, n, &mut s.moe, os, st)?;
+                                let d = ml.dims;
+                                moe::combine_pairs(
+                                    &s.moe.y_pairs,
+                                    &s.moe.pick,
+                                    &s.moe.wts,
+                                    Some(&s.moe_shared_out),
+                                    &mut s.mixer_out,
+                                    n,
+                                    &d,
+                                    st,
+                                )?;
+                            }
+                        }
                     }
                 }
                 gb_cuda::glm_mtp::add_f32(&mut x, &s.mixer_out, n * h, st)?;

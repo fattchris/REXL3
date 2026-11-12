@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The largest group this family's runtime, plan and tests cover: two ranks (the configuration lane L2b proves). Not a measurement.
-pub const MAX_TP_RANKS: usize = 2;
+pub const MAX_TP_RANKS: usize = 4;
 
 /// The frame kinds of the prefix cache's calls (`docs/GLM_TP.md` 4.2): a block of their own in the family's range, clear of the draft
 /// calls' (32, 33) and the image chunk's (40).
