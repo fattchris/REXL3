@@ -151,6 +151,14 @@ impl<'a> Binder<'a> {
         self.plain_x(name, dtype, shape, Xform::None, region, category)
     }
 
+    /// A 16-bit plain tensor the kernels read as fp16: an fp16 pack stores it as is; a bf16 pack is narrowed on the way (exact or refused).
+    fn plain16(&mut self, name: &str, shape: &[usize], region: RegionId, category: Category) -> PlainTensor {
+        match self.inv.plain.get(name).map(|t| t.dtype.as_str()) {
+            Some("BF16") => self.plain_x(name, PlainDtype::Bf16, shape, Xform::Bf16ToF16Exact, region, category),
+            _ => self.plain(name, PlainDtype::F16, shape, region, category),
+        }
+    }
+
     /// A plain tensor the loader converts on the way (`xform`): the destination takes the converted size.
     fn plain_x(
         &mut self,
@@ -353,9 +361,20 @@ impl<'a> Binder<'a> {
         let q_b_proj = self.group(&format!("{a}q_b_proj"), q_rank, heads * qk, Some(region), cat);
         let kv_a_proj_with_mqa = self.group_padded(&format!("{a}kv_a_proj_with_mqa"), h, kv_rank + rope, Some(region), cat);
         let kv_a_layernorm = self.plain_x(&format!("{a}kv_a_layernorm.weight"), Bf16, &[kv_rank], Xform::Bf16ToF32, region, cat);
-        // plain fp16, not EXL3 and not bf16; the kernels read it split per head and packed (W_UK, transposed W_UV)
-        let kv_b_proj =
-            self.plain_x(&format!("{a}kv_b_proj.weight"), F16, &[heads * (nope + v), kv_rank], Xform::PackKvB, region, cat);
+        // plain 16-bit, not EXL3; the kernels read it split per head and packed (W_UK, transposed W_UV). An fp16 pack is packed as stored;
+        // a bf16 pack is converted to fp16 first (the packers and kernels are fp16).
+        let kv_b_name = format!("{a}kv_b_proj.weight");
+        let kv_b_proj = match self.inv.plain.get(&kv_b_name).map(|t| t.dtype.as_str()) {
+            Some("BF16") => self.plain_x(
+                &kv_b_name,
+                PlainDtype::Bf16,
+                &[heads * (nope + v), kv_rank],
+                Xform::PackKvBBf16,
+                region,
+                cat,
+            ),
+            _ => self.plain_x(&kv_b_name, F16, &[heads * (nope + v), kv_rank], Xform::PackKvB, region, cat),
+        };
         let o_proj = self.group(&format!("{a}o_proj"), heads * v, h, Some(region), cat);
         let indexer = match indexer {
             IndexerMode::Full => Some(self.indexer(&a, region, cat)),
@@ -379,10 +398,10 @@ impl<'a> Binder<'a> {
             };
         IndexerWeights {
             wq_b,
-            wk: self.plain(&format!("{i}wk.weight"), F16, &[d, h], region, cat),
-            weights_proj: self.plain(&format!("{i}weights_proj.weight"), F16, &[heads, h], region, cat),
-            k_norm_weight: self.plain(&format!("{i}k_norm.weight"), F16, &[d], region, cat),
-            k_norm_bias: self.plain(&format!("{i}k_norm.bias"), F16, &[d], region, cat),
+            wk: self.plain16(&format!("{i}wk.weight"), &[d, h], region, cat),
+            weights_proj: self.plain16(&format!("{i}weights_proj.weight"), &[heads, h], region, cat),
+            k_norm_weight: self.plain16(&format!("{i}k_norm.weight"), &[d], region, cat),
+            k_norm_bias: self.plain16(&format!("{i}k_norm.bias"), &[d], region, cat),
             kpool: (kpool > 0).then(|| KpoolWeights {
                 compress_ape: self.plain(&format!("{i}index_kpool_compress_ape"), F32, &[kpool, d], region, cat),
                 compress_gate: self.plain(&format!("{i}index_kpool_compress_gate"), F16, &[d, h], region, cat),
@@ -583,7 +602,7 @@ impl<'a> Binder<'a> {
             }
             Ffn::Moe => {
                 let router =
-                    self.plain(&format!("{l}mlp.gate.weight"), PlainDtype::F16, &[self.cfg.ffn.routed_experts, h], region, trunk);
+                    self.plain16(&format!("{l}mlp.gate.weight"), &[self.cfg.ffn.routed_experts, h], region, trunk);
                 let bias = self.plain_x(
                     &format!("{l}mlp.gate.e_score_correction_bias"),
                     PlainDtype::F32,
@@ -894,7 +913,21 @@ impl GlmWeights {
             b.plain(&format!("{}embed_tokens.weight", cfg.text_prefix), PlainDtype::Bf16, &[cfg.vocab, cfg.hidden], global, Category::Embedding);
         let final_norm =
             b.plain_x(&format!("{}norm.weight", cfg.text_prefix), PlainDtype::Bf16, &[cfg.hidden], Xform::Bf16ToF32, global, Category::Other);
-        let lm_head = b.group("lm_head", cfg.hidden, cfg.vocab, Some(global), Category::Head);
+        // the SAGE pack ships two heads: an 8-bit EXL3 group and a plain bf16 shard (`model-lmhead-bf16.safetensors`). The reference
+        // engine serves the bf16 one, so this engine does too; the EXL3 group it does not use is skipped by name, not silently.
+        let lm_head = if inv.plain.contains_key("lm_head.weight") {
+            LmHeadWeights::PlainF16(b.plain16("lm_head.weight", &[cfg.vocab, cfg.hidden], global, Category::Head))
+        } else {
+            LmHeadWeights::Exl3(b.group("lm_head", cfg.hidden, cfg.vocab, Some(global), Category::Head))
+        };
+        if inv.plain.contains_key("lm_head.weight") && inv.groups.contains_key("lm_head") {
+            b.used_groups.insert("lm_head".into());
+            b.skipped.push(Skipped {
+                name: "lm_head".into(),
+                group: true,
+                why: "the pack ships both heads; this engine uses the plain bf16 head the reference serves",
+            });
+        }
 
         let mut layers = Vec::with_capacity(cfg.layers.len());
         for (i, spec) in cfg.layers.iter().enumerate() {
@@ -907,7 +940,11 @@ impl GlmWeights {
             let region = b.region(RegionKind::Trunk(index));
             let l = format!("{}layers.{index}.", cfg.text_prefix);
             let h = cfg.hidden;
-            let eh_proj = b.group(&format!("{l}eh_proj"), 2 * h, h, Some(region), Category::Mtp);
+            let eh_proj = if !inv.groups.contains_key(&format!("{l}eh_proj")) && inv.plain.contains_key(&format!("{l}eh_proj.weight")) {
+                MtpEhProj::PlainF16(b.plain16(&format!("{l}eh_proj.weight"), &[h, 2 * h], region, Category::Mtp))
+            } else {
+                MtpEhProj::Exl3(b.group(&format!("{l}eh_proj"), 2 * h, h, Some(region), Category::Mtp))
+            };
             let enorm = b.plain_x(&format!("{l}enorm.weight"), PlainDtype::Bf16, &[h], Xform::Bf16ToF32, region, Category::Mtp);
             let hnorm = b.plain_x(&format!("{l}hnorm.weight"), PlainDtype::Bf16, &[h], Xform::Bf16ToF32, region, Category::Mtp);
             let shared_head_norm = b.plain_x(

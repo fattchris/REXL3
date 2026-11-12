@@ -87,6 +87,11 @@ pub enum Xform {
     /// fp32 narrowed to fp16, which must be exact for every element (an mHC `fn` matrix: all 90 of the pack's are, and fp16
     /// halves the dominant read of a site). An element that would round fails the load.
     F32ToF16Exact,
+    /// bf16 narrowed to fp16, which must be exact for every element (a pack that stores in bf16 a tensor the fp16 kernels read): the
+    /// conversion goes through f32 and a value fp16 cannot hold exactly fails the load.
+    Bf16ToF16Exact,
+    /// `kv_b_proj` stored bf16: the same split and pack as [`Xform::PackKvB`], converted to fp16 on the way.
+    PackKvBBf16,
     /// The router's selection bias: fp32 `[experts]` minus its mean (torch's reduction order), rounded to fp16, as fp32
     /// (`gb_cuda::moe::centred_bias_host`), the arithmetic the oracle applies at load.
     CentredBias,
@@ -109,8 +114,13 @@ impl Xform {
     pub fn dst_bytes(self, src_bytes: u64) -> u64 {
         match self {
             Xform::Bf16ToF32 => src_bytes * 2,
-            Xform::F32ToF16Exact => src_bytes / 2,
-            Xform::None | Xform::CentredBias | Xform::PackKvB | Xform::FoldPatchF16 | Xform::PermuteDownsampleF16 => src_bytes,
+            Xform::F32ToF16Exact | Xform::Bf16ToF16Exact => src_bytes / 2,
+            Xform::None
+            | Xform::CentredBias
+            | Xform::PackKvB
+            | Xform::PackKvBBf16
+            | Xform::FoldPatchF16
+            | Xform::PermuteDownsampleF16 => src_bytes,
         }
     }
 }
@@ -427,12 +437,26 @@ pub struct GlmLayerWeights {
     pub ffn: FfnWeights,
 }
 
+/// The trunk's `lm_head`: an EXL3 group, or the plain 16-bit matrix a pack stores unpacked (`[vocab, hidden]`, run by the fp16 GEMV).
+#[derive(Clone, Debug, PartialEq)]
+pub enum LmHeadWeights {
+    Exl3(Exl3Linear),
+    PlainF16(PlainTensor),
+}
+
+/// The NextN layer's `eh_proj`: an EXL3 group, or the plain 16-bit matrix a pack stores unpacked (`[hidden, 2 x hidden]`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MtpEhProj {
+    Exl3(Exl3Linear),
+    PlainF16(PlainTensor),
+}
+
 /// The NextN/MTP layer (index 45): `eh_proj` fuses the embedded token and the trunk's hidden, then a full MLA + indexer + MoE layer
 /// on a plain residual, then `shared_head.norm` and the trunk's `lm_head`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlmMtpWeights {
     /// `[2 x hidden -> hidden]`.
-    pub eh_proj: Exl3Linear,
+    pub eh_proj: MtpEhProj,
     pub enorm: PlainTensor,
     pub hnorm: PlainTensor,
     pub shared_head_norm: PlainTensor,
@@ -542,7 +566,7 @@ pub struct GlmWeights {
     /// bf16 `[hidden]`.
     pub final_norm: PlainTensor,
     /// `[hidden -> vocab]`.
-    pub lm_head: Exl3Linear,
+    pub lm_head: LmHeadWeights,
     /// The trunk, `layers[i].index == i`.
     pub layers: Vec<GlmLayerWeights>,
     /// The NextN layers after the trunk (none or one).
@@ -756,12 +780,18 @@ impl GlmWeights {
     pub fn visit<'a>(&'a self, f: &mut dyn FnMut(Leaf<'a>)) {
         f(Leaf::Plain(&self.embed_tokens));
         f(Leaf::Plain(&self.final_norm));
-        f(Leaf::Exl3(&self.lm_head));
+        match &self.lm_head {
+            LmHeadWeights::Exl3(g) => f(Leaf::Exl3(g)),
+            LmHeadWeights::PlainF16(t) => f(Leaf::Plain(t)),
+        }
         for l in &self.layers {
             l.visit(f);
         }
         for m in &self.mtp {
-            f(Leaf::Exl3(&m.eh_proj));
+            match &m.eh_proj {
+                MtpEhProj::Exl3(g) => f(Leaf::Exl3(g)),
+                MtpEhProj::PlainF16(t) => f(Leaf::Plain(t)),
+            }
             for t in [&m.enorm, &m.hnorm, &m.shared_head_norm] {
                 f(Leaf::Plain(t));
             }
