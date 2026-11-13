@@ -787,7 +787,7 @@ pub fn start_follower(o: &ServeOptions) -> Result<(), ModelError> {
 pub fn start_follower_in(registry: &Registry, o: &ServeOptions) -> Result<(), ModelError> {
     check_options(o)?;
     let (family, plan) = registry.probe(&o.model_dir)?;
-    refuse_tensor_parallel(family, o, 1)?;
+    refuse_tensor_parallel(family, o, o.tp.as_ref().map_or(0, |t| t.rank))?;
     refuse_unbuilt_vision(&plan, o)?;
     // every rank checks its own pack against the list, as rank 0 does (the group's flags are one list: `rexl3-cluster` serve.flags)
     check_pack_dirs(o)?;
