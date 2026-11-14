@@ -60,8 +60,14 @@ fn the_rope_tables_match_the_reference_formula() {
 }
 
 fn one_case(dt: Dtype, rows: usize, pos: &[i32]) {
+    one_case_ctx(dt, rows, pos, None)
+}
+
+/// [`one_case`] with an explicit context bound: the engine's slabs pass the *call's* last position as `max_context`, which can be
+/// far past the slab's own positions (middle slabs of a long prefill).
+fn one_case_ctx(dt: Dtype, rows: usize, pos: &[i32], max_ctx: Option<usize>) {
     let st = Stream::new().unwrap();
-    let max_pos = *pos.iter().max().unwrap() as usize + 2;
+    let max_pos = max_ctx.unwrap_or(*pos.iter().max().unwrap() as usize + 2);
     let (cos_h, sin_h) = mla::rope_tables(max_pos, rope_theta());
     let cos = DevBuf::from_slice(
         &cos_h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
@@ -90,12 +96,13 @@ fn one_case(dt: Dtype, rows: usize, pos: &[i32]) {
     let uk = DevBuf::from_slice(&uk_host).unwrap();
     let w = MlaWeights { uk, uvt: DevBuf::alloc(1).unwrap(), dtype: dt };
 
-    // the latent cache and the block table (one slot, pos rows on page 0)
-    let n_blocks = 2;
+    // the latent cache and the block table: one page per 256 positions (a single page cannot hold a context past 256, and a
+    // table that maps every block to page 0 makes the attention read another position's slot)
+    let pages = max_pos.div_ceil(BLOCK_TOKENS) + 1;
+    let n_blocks = pages;
     let mut cache = LatentCache::new_rope(n_blocks, dt).unwrap();
-    let mut table_host = vec![0u32; 4];
-    table_host[0] = 0;
-    let table = BlockTable::from_host(&[table_host], 4).unwrap();
+    let table_host: Vec<u32> = (0..pages as u32).collect();
+    let table = BlockTable::from_host(&[table_host], pages).unwrap();
     let slots = vec![0i32; rows];
     let ri = RowIndex::from_host(&slots, pos).unwrap();
 
@@ -267,6 +274,26 @@ fn one_case(dt: Dtype, rows: usize, pos: &[i32]) {
     }
 }
 
+/// The dense attention across several 256-key chunks: where the merge of chunk partials first breaks.
+#[test]
+fn the_rope_path_holds_across_chunk_boundaries() {
+    if !device_available() {
+        return;
+    }
+    eprintln!("case rows 128 positions 512..639, context 886 (a middle slab)");
+    one_case_ctx(Dtype::F16, 128, &(512..640).collect::<Vec<i32>>(), Some(886));
+    eprintln!("case rows 1 position 500 head-check done");
+    for start in [60usize, 100, 130, 160, 200, 250] {
+        eprintln!("case rows 1 position {start}");
+        one_case(Dtype::F16, 1, &[start as i32]);
+    }
+    for (rows, start) in [(2usize, 250usize), (2, 500), (2, 760), (2, 878), (8, 878), (128, 760)] {
+        let pos: Vec<i32> = (start..start + rows).map(|p| p as i32).collect();
+        eprintln!("case rows {rows} positions {start}..{}", start + rows - 1);
+        one_case(Dtype::F16, rows, &pos);
+    }
+}
+
 #[test]
 fn the_rope_path_matches_the_host_reference_fp16_and_bf16() {
     if !device_available() {
@@ -281,5 +308,129 @@ fn the_rope_path_matches_the_host_reference_fp16_and_bf16() {
         one_case(dt, 18, &pref);
         let big: Vec<i32> = (0..128).collect();
         one_case(dt, 128, &big);
+    }
+}
+
+/// The chunk partials of a two-chunk row against the host's own chunked softmax (the merge's inputs).
+#[test]
+fn chunk_partials_of_a_two_chunk_row_match_the_host() {
+    if !device_available() {
+        return;
+    }
+    use gb_cuda::DevBuf;
+    let st = Stream::new().unwrap();
+    let rows = 1usize;
+    let pos = [500i32];
+    let dt = Dtype::F16;
+    let max_pos = 502usize;
+    let (cos_h, sin_h) = mla::rope_tables(max_pos, rope_theta());
+    let cos = DevBuf::from_slice(&cos_h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let sin = DevBuf::from_slice(&sin_h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let mut r = Rng(0x1234_5678);
+    let hs = 64usize;
+    let qk = NOPE_DIM_FULL + ROPE_DIM;
+    let q_host: Vec<u16> = (0..rows * hs * qk).map(|_| enc(dt, r.uniform(-0.5, 0.5))).collect();
+    let q = DevBuf::from_slice(&q_host).unwrap();
+    let uk_host: Vec<u16> = (0..hs * NOPE_DIM_FULL * LATENT_DIM).map(|_| enc(dt, r.uniform(-0.05, 0.05))).collect();
+    let uk = DevBuf::from_slice(&uk_host).unwrap();
+    let w = MlaWeights { uk, uvt: DevBuf::alloc(1).unwrap(), dtype: dt };
+    let n_blocks = 4usize;
+    let mut cache = LatentCache::new_rope(n_blocks, dt).unwrap();
+    let mut table_host = vec![0u32; 8];
+    for (i, t) in table_host.iter_mut().enumerate() { *t = i as u32; }
+    let table = BlockTable::from_host(&[table_host], 8).unwrap();
+    let slots = vec![0i32; rows];
+    let ri = RowIndex::from_host(&slots, &pos).unwrap();
+    let kv_stride = LATENT_DIM + ROPE_DIM;
+    let mut lat_host = vec![0u16; max_pos * LATENT_DIM];
+    let mut kv_host = vec![0u16; max_pos * kv_stride];
+    let mut lat_f = vec![vec![0f32; LATENT_DIM]; max_pos];
+    let mut rope_f = vec![vec![0f32; ROPE_DIM]; max_pos];
+    for p in 0..max_pos {
+        for c in 0..LATENT_DIM {
+            lat_host[p * LATENT_DIM + c] = enc(dt, r.uniform(-1.0, 1.0));
+            lat_f[p][c] = dec(dt, lat_host[p * LATENT_DIM + c]);
+        }
+        for c in 0..ROPE_DIM {
+            kv_host[p * kv_stride + LATENT_DIM + c] = enc(dt, r.uniform(-1.0, 1.0));
+            rope_f[p][c] = dec(dt, kv_host[p * kv_stride + LATENT_DIM + c]);
+        }
+    }
+    let lat = DevBuf::from_slice(&lat_host).unwrap();
+    let kv = DevBuf::from_slice(&kv_host).unwrap();
+    let cache_slots = vec![0i32; max_pos];
+    let cache_pos: Vec<i32> = (0..max_pos as i32).collect();
+    let cache_rows = RowIndex::from_host(&cache_slots, &cache_pos).unwrap();
+    latent_write_rope(&lat, &kv, kv_stride, LATENT_DIM, &cos, &sin, ROPE_DIM / 2, &cache_rows, &table, &mut cache, max_pos, &st).unwrap();
+    let mut q_lat = DevBuf::alloc(rows * hs * LATENT_DIM * 2).unwrap();
+    let mut qrot = DevBuf::alloc(rows * hs * ROPE_DIM * 2).unwrap();
+    absorb_rope(&q, hs * qk, qk, NOPE_DIM_FULL, &w, &mut q_lat, &mut qrot, &cos, &sin, ROPE_DIM / 2, &ri, rows, &st).unwrap();
+    let mut o_lat = DevBuf::alloc(rows * hs * LATENT_DIM * 2).unwrap();
+    let mut ws = DevBuf::alloc(mla::attend_workspace_bytes(rows, max_pos)).unwrap();
+    attend_rope(&q_lat, &qrot, &cache, &table, &ri, rows, &mut o_lat, max_pos, max_pos, &mut ws, &st).unwrap();
+    st.sync().unwrap();
+    let ch = mla::CHUNK_KEYS;
+    let nch = (max_pos + ch - 1) / ch;
+    let pairs = rows * hs * nch;
+    let wsv: Vec<f32> = ws.to_vec().unwrap();
+    let (po, pm, pl) = (0usize, pairs * LATENT_DIM, pairs * LATENT_DIM + pairs);
+    let ql = q_lat.to_vec::<u16>().unwrap();
+    let qrv = qrot.to_vec::<u16>().unwrap();
+    // host chunk partials for head 0
+    let h = 0usize;
+    let qlv: Vec<f32> = (0..LATENT_DIM).map(|c| dec(dt, ql[h * LATENT_DIM + c])).collect();
+    let qrvv: Vec<f32> = (0..ROPE_DIM).map(|d| dec(dt, qrv[h * ROPE_DIM + d])).collect();
+    let hh = ROPE_DIM / 2;
+    let mut krot = vec![vec![0f32; ROPE_DIM]; max_pos];
+    for j in 0..max_pos { krot[j] = rope_rotate(&rope_f[j][..], &cos_h[j * hh..(j + 1) * hh], &sin_h[j * hh..(j + 1) * hh]); }
+    for c in 0..nch {
+        let lo = c * ch;
+        let hi = (lo + ch).min(pos[0] as usize + 1);
+        if lo >= hi { continue; }
+        let mut mx = f32::NEG_INFINITY;
+        let mut s = vec![0f32; hi - lo];
+        for j in lo..hi {
+            let mut a = 0.0f32;
+            for k in 0..LATENT_DIM { a += qlv[k] * lat_f[j][k]; }
+            for d in 0..ROPE_DIM { a += qrvv[d] * krot[j][d]; }
+            s[j - lo] = a / 16.0;
+            mx = mx.max(s[j - lo]);
+        }
+        let e: Vec<f32> = s.iter().map(|v| (v - mx).exp()).collect();
+        let l: f32 = e.iter().sum();
+        let mut o = vec![0f32; LATENT_DIM];
+        for (i, j) in (lo..hi).enumerate() { for k in 0..LATENT_DIM { o[k] += e[i] * lat_f[j][k]; } }
+        let base = (h * 0 + h) * nch + c;
+        let gm = wsv[pm + base];
+        let gl = wsv[pl + base];
+        let go = &wsv[po + base * LATENT_DIM..po + (base + 1) * LATENT_DIM];
+        let cos_o = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0f32, 0f32, 0f32);
+            for i in 0..a.len() { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+            d / (na.sqrt() * nb.sqrt() + 1e-12)
+        };
+        eprintln!("chunk {c}: host m {mx:.4} l {l:.4} | gpu m {gm:.4} l {gl:.4} | o cos {:.5} (gpu |o| {:.4}, host |o| {:.4})",
+            cos_o(go, &o), go.iter().map(|v| v * v).sum::<f32>().sqrt(), o.iter().map(|v| v * v).sum::<f32>().sqrt());
+        // a host merge of the GPU's own partials, then the kernel's merged row against it
+        let mut gm_ = -f32::INFINITY;
+        for cc in 0..nch {
+            let b = (h * 0 + h) * nch + cc;
+            gm_ = gm_.max(wsv[pm + b]);
+        }
+        let mut ml = 0f32;
+        let mut mo = vec![0f32; LATENT_DIM];
+        for cc in 0..nch {
+            let b = (h * 0 + h) * nch + cc;
+            let (cm, cl) = (wsv[pm + b], wsv[pl + b]);
+            if !(cl > 0.0) { continue; }
+            let w = (cm - gm_).exp2();
+            ml += cl * w;
+            for k in 0..LATENT_DIM { mo[k] += wsv[po + b * LATENT_DIM + k] * w; }
+        }
+        for k in 0..LATENT_DIM { mo[k] /= ml; }
+        let outv = o_lat.to_vec::<u16>().unwrap();
+        let ko: Vec<f32> = (0..LATENT_DIM).map(|k| dec(dt, outv[h * LATENT_DIM + k])).collect();
+        eprintln!("  merged: host-of-gpu-partials |o| {:.4} vs kernel |o| {:.4} cos {:.5}",
+            mo.iter().map(|v| v * v).sum::<f32>().sqrt(), ko.iter().map(|v| v * v).sum::<f32>().sqrt(), cos_o(&mo, &ko));
     }
 }

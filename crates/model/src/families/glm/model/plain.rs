@@ -388,6 +388,38 @@ fn mixer_rope(
             }
         }
     }
+    if std::env::var_os("REXL3_GLM_CACHE_ALL").is_some() && layer == 0 {
+        // debug: the whole latent cache and rope plane after this call's writes (layer 0 only), so two ranks' caches can be
+        // compared without assuming which positions the attention reads this call
+        st.sync()?;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let total = latent.lat.bytes();
+        let step = 1 << 20;
+        let mut off = 0usize;
+        while off < total {
+            let n = step.min(total - off);
+            let mut v = vec![0u8; n];
+            latent.lat.download_range(off, &mut v)?;
+            for b in &v {
+                h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            off += n;
+        }
+        if let Some(rot) = latent.rot.as_ref() {
+            let total = rot.bytes();
+            let mut off = 0usize;
+            while off < total {
+                let n = step.min(total - off);
+                let mut v = vec![0u8; n];
+                rot.download_range(off, &mut v)?;
+                for b in &v {
+                    h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+                }
+                off += n;
+            }
+        }
+        eprintln!("rexl3 event=cache_all layer={layer} bytes={total} hash={h:016x}");
+    }
     if let Ok(path) = std::env::var("REXL3_GLM_INV_DUMP") {
         // debug: layer 0's attention output for the first rows, every head, with the rows' positions and the cached latents
         // those rows read: a host reference (from the pack's own weights) is compared against it
