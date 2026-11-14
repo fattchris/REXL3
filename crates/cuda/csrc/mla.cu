@@ -687,7 +687,13 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
             }
         }
         if constexpr (MT == 1) {
-            __syncwarp();  // every lane's ldmatrix of this stage is done before it is restaged
+            // every lane's read of this stage is done before it is restaged. The rope tile is shared by the CTA (warp 0 stages
+            // it), so with ROPE the whole CTA syncs; the dense quarters are per-warp and need the warp only.
+            if constexpr (ROPE) {
+                __syncthreads();
+            } else {
+                __syncwarp();
+            }
             stage(t + 2, t & 1);
             commit();
         }

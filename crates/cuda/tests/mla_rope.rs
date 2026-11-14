@@ -434,3 +434,125 @@ fn chunk_partials_of_a_two_chunk_row_match_the_host() {
             mo.iter().map(|v| v * v).sum::<f32>().sqrt(), ko.iter().map(|v| v * v).sum::<f32>().sqrt(), cos_o(&mo, &ko));
     }
 }
+
+/// The sparse (DSA) attention over a synthetic selection, against the host, and its hash printed: two GPUs running this must
+/// agree bit for bit.
+#[test]
+fn the_sparse_path_matches_the_host_and_is_gpu_independent() {
+    if !device_available() {
+        return;
+    }
+    use gb_cuda::DevBuf;
+    let st = Stream::new().unwrap();
+    let dt = Dtype::F16;
+    let rows = 4usize;
+    let pos = [5000i32, 5001, 5002, 5003];
+    let max_pos = 5006usize;
+    let (cos_h, sin_h) = mla::rope_tables(max_pos, rope_theta());
+    let cos = DevBuf::from_slice(&cos_h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let sin = DevBuf::from_slice(&sin_h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let mut r = Rng(0xDEAD_BEEF);
+    let hs = 64usize;
+    let qk = NOPE_DIM_FULL + ROPE_DIM;
+    let q_host: Vec<u16> = (0..rows * hs * qk).map(|_| enc(dt, r.uniform(-0.5, 0.5))).collect();
+    let q = DevBuf::from_slice(&q_host).unwrap();
+    let uk_host: Vec<u16> = (0..hs * NOPE_DIM_FULL * LATENT_DIM).map(|_| enc(dt, r.uniform(-0.05, 0.05))).collect();
+    let uk = DevBuf::from_slice(&uk_host).unwrap();
+    let w = MlaWeights { uk, uvt: DevBuf::alloc(1).unwrap(), dtype: dt };
+    let pages = max_pos.div_ceil(BLOCK_TOKENS) + 1;
+    let mut cache = LatentCache::new_rope(pages, dt).unwrap();
+    let table_host: Vec<u32> = (0..pages as u32).collect();
+    let table = BlockTable::from_host(&[table_host], pages).unwrap();
+    let slots = vec![0i32; rows];
+    let ri = RowIndex::from_host(&slots, &pos).unwrap();
+    let kv_stride = LATENT_DIM + ROPE_DIM;
+    let mut lat_host = vec![0u16; max_pos * LATENT_DIM];
+    let mut kv_host = vec![0u16; max_pos * kv_stride];
+    let mut lat_f = vec![vec![0f32; LATENT_DIM]; max_pos];
+    let mut rope_f = vec![vec![0f32; ROPE_DIM]; max_pos];
+    for p in 0..max_pos {
+        for c in 0..LATENT_DIM {
+            lat_host[p * LATENT_DIM + c] = enc(dt, r.uniform(-1.0, 1.0));
+            lat_f[p][c] = dec(dt, lat_host[p * LATENT_DIM + c]);
+        }
+        for c in 0..ROPE_DIM {
+            kv_host[p * kv_stride + LATENT_DIM + c] = enc(dt, r.uniform(-1.0, 1.0));
+            rope_f[p][c] = dec(dt, kv_host[p * kv_stride + LATENT_DIM + c]);
+        }
+    }
+    let lat = DevBuf::from_slice(&lat_host).unwrap();
+    let kv = DevBuf::from_slice(&kv_host).unwrap();
+    let cache_slots = vec![0i32; max_pos];
+    let cache_pos: Vec<i32> = (0..max_pos as i32).collect();
+    let cache_rows = RowIndex::from_host(&cache_slots, &cache_pos).unwrap();
+    latent_write_rope(&lat, &kv, kv_stride, LATENT_DIM, &cos, &sin, ROPE_DIM / 2, &cache_rows, &table, &mut cache, max_pos, &st).unwrap();
+    let mut q_lat = DevBuf::alloc(rows * hs * LATENT_DIM * 2).unwrap();
+    let mut qrot = DevBuf::alloc(rows * hs * ROPE_DIM * 2).unwrap();
+    absorb_rope(&q, hs * qk, qk, NOPE_DIM_FULL, &w, &mut q_lat, &mut qrot, &cos, &sin, ROPE_DIM / 2, &ri, rows, &st).unwrap();
+    // a synthetic selection per row: 2048 keys, a deterministic subset of 0..=pos (spread out), ascending
+    let k = 2048usize;
+    let stride = gb_cuda::glm_idx::K_STRIDE;
+    let mut sel_host = vec![-1i32; rows * stride];
+    let mut meta_host = vec![0i32; rows * 2];
+    let mut chosen: Vec<Vec<usize>> = Vec::new();
+    for rr in 0..rows {
+        let n = pos[rr] as usize + 1;
+        let take = n.min(k);
+        let stepf = n as f64 / take as f64;
+        let mut list: Vec<usize> = (0..take).map(|i| ((i as f64) * stepf) as usize).collect();
+        list.dedup();
+        for (j, &p) in list.iter().enumerate() {
+            sel_host[rr * stride + j] = p as i32;
+        }
+        meta_host[2 * rr] = 1;
+        meta_host[2 * rr + 1] = list.len() as i32;
+        chosen.push(list);
+    }
+    let sel = DevBuf::from_slice(&sel_host).unwrap();
+    let meta = DevBuf::from_slice(&meta_host).unwrap();
+    let mut o_lat = DevBuf::alloc(rows * hs * LATENT_DIM * 2).unwrap();
+    let mut ws = DevBuf::alloc(mla::attend_workspace_bytes(rows, gb_cuda::glm_idx::K_STRIDE)).unwrap();
+    let s = SparseSel { indices: &sel, meta: &meta, stride };
+    attend_rope_sparse(&q_lat, &qrot, &cache, &table, &ri, &s, rows, &mut o_lat, stride, &mut ws, &st).unwrap();
+    st.sync().unwrap();
+    let got: Vec<u16> = o_lat.to_vec().unwrap();
+    let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+    for b in got.iter().flat_map(|v| v.to_le_bytes()) {
+        hsh = (hsh ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    eprintln!("sparse o_lat hash {hsh:016x}");
+    // host reference for row 0, head 0 over its selection
+    let ql: Vec<f32> = (0..LATENT_DIM).map(|c| dec(dt, got[0 * LATENT_DIM + c])).collect();
+    let qlv: Vec<f32> = {
+        let ql16 = q_lat.to_vec::<u16>().unwrap();
+        (0..LATENT_DIM).map(|c| dec(dt, ql16[c])).collect()
+    };
+    let qrv: Vec<f32> = {
+        let qr16 = qrot.to_vec::<u16>().unwrap();
+        (0..ROPE_DIM).map(|d| dec(dt, qr16[d])).collect()
+    };
+    let hh = ROPE_DIM / 2;
+    let mut krot = vec![vec![0f32; ROPE_DIM]; max_pos];
+    for j in 0..max_pos { krot[j] = rope_rotate(&rope_f[j][..], &cos_h[j * hh..(j + 1) * hh], &sin_h[j * hh..(j + 1) * hh]); }
+    let list = &chosen[0];
+    let mut mx = f32::NEG_INFINITY;
+    let mut sc = vec![0f32; list.len()];
+    for (i, &j) in list.iter().enumerate() {
+        let mut a = 0.0f32;
+        for c in 0..LATENT_DIM { a += qlv[c] * lat_f[j][c]; }
+        for d in 0..ROPE_DIM { a += qrv[d] * krot[j][d]; }
+        sc[i] = a / 16.0;
+        mx = mx.max(sc[i]);
+    }
+    let e: Vec<f32> = sc.iter().map(|v| (v - mx).exp()).collect();
+    let z: f32 = e.iter().sum();
+    let mut worst = 0f32;
+    for c in (0..LATENT_DIM).step_by(29) {
+        let mut acc = 0.0f32;
+        for (i, &j) in list.iter().enumerate() { acc += e[i] / z * lat_f[j][c]; }
+        let g = dec(dt, got[c]);
+        worst = worst.max((g - acc).abs() / (acc.abs() + 1.0));
+        assert!((g - acc).abs() <= 5e-2 + 5e-2 * acc.abs(), "sparse o_lat[{c}] {g} vs {acc}");
+    }
+    eprintln!("sparse worst rel {worst:.4}; ql[0] {:.4}", ql[0]);
+}
