@@ -230,3 +230,17 @@ fn glm_image_prompts_expand_to_the_ids_the_hf_processor_produces() {
     }
     assert!(cases >= 15 && images >= 20 && biggest >= 400, "{cases} cases, {images} images, biggest run {biggest}");
 }
+
+/// The rendered chat prompt and its ids for one message, printed (a diagnostic; run with `REXL3_GLM_DIR` and `--nocapture`).
+#[test]
+fn glm_rendered_prompt_ids_for_a_message() {
+    let Some(d) = glm_dir() else { return eprintln!("REXL3_GLM_DIR not set: skipping") };
+    let tok = Tok::from_dir(&d).unwrap();
+    let f = GlmFormat::new(&std::fs::read_to_string(d.join("chat_template.jinja")).unwrap()).unwrap();
+    let msgs: Value = json!([{"role": "user", "content": "Count from one to ten."}]);
+    let kwargs = serde_json::Map::new();
+    let r = f.render(&msgs, &kwargs).unwrap();
+    let ids = tok.encode(&r.text).unwrap();
+    eprintln!("render text={:?}", r.text);
+    eprintln!("render ids={:?} n={}", ids, ids.len());
+}
