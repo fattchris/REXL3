@@ -2305,6 +2305,11 @@ impl GlmModel {
         let mut vals = vec![0f32; rows * count];
         s.topk_ids.download(&mut ids)?;
         s.topk_vals.download(&mut vals)?;
+        if std::env::var_os("REXL3_GLM_CAND_DUMP").is_some() {
+            // debug: the rank's own candidates, so a 4-rank divergence names its size (same ids with ulp values, or other ids)
+            let bits: Vec<u32> = vals.iter().map(|v| v.to_bits()).collect();
+            eprintln!("rexl3 event=cand_dump rows={rows} count={count} ids={ids:?} vals_bits={bits:x?}");
+        }
         Ok(Candidates { rows, count, ids, vals })
     }
 

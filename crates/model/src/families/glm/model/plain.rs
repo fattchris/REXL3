@@ -42,7 +42,20 @@ impl GlmModel {
                     (Some(ix), Some(plane)) => Some((ix, &mut *plane)),
                     _ => None,
                 };
-                mixer_rope(cfg, w, idx, &mut latent[ord], s, table, &ri, n, max_pos, cos, sin, st)?;
+                mixer_rope(cfg, w, idx, &mut latent[ord], s, table, &ri, n, max_pos, cos, sin, l, st)?;
+                if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() {
+                    // debug: the mixer's own output, so a layer divergence splits into the mixer and the FFN
+                    st.sync()?;
+                    let mut v = vec![0f32; n * h];
+                    s.mixer_out.download(&mut v)?;
+                    let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+                    for f in &v[(n - 1) * h..n * h] {
+                        for b in f.to_le_bytes() {
+                            hsh = (hsh ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                        }
+                    }
+                    eprintln!("rexl3 event=mix_dump layer={l} a={a} n={n} rows={rows} hash={hsh:016x}");
+                }
                 gb_cuda::glm_mtp::add_rmsnorm_f32(&mut x, &s.mixer_out, &layer.post_norm, &mut s.hidden, n, h, RMS_EPS, st)?;
                 match &layer.ffn {
                     FfnDevice::Dense(m) => {
@@ -92,13 +105,41 @@ impl GlmModel {
                     }
                 }
                 gb_cuda::glm_mtp::add_f32(&mut x, &s.mixer_out, n * h, st)?;
+                if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() {
+                    // debug: a digest of the last row's residual after each layer, so a rank divergence names its layer
+                    let mut v = vec![0f32; n * h];
+                    st.sync()?;
+                    x.download(&mut v)?;
+                    let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+                    for f in &v[(n - 1) * h..n * h] {
+                        for b in f.to_le_bytes() {
+                            hsh = (hsh ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                        }
+                    }
+                    eprintln!("rexl3 event=layer_dump layer={l} a={a} n={n} rows={rows} hash={hsh:016x}");
+                }
             }
             gb_cuda::glm_mtp::rmsnorm_f32_f16(&x, &dev.final_norm, &mut s.hidden, n, h, RMS_EPS, st)?;
             match head {
                 Head::None => {}
                 Head::LastRow => {
                     let hv = s.hidden.subview((n - 1) * h * 2, h * 2);
+                    if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() {
+                        // debug: the head's input (the final norm's last row) and its output, so a candidate difference is placed
+                        st.sync()?;
+                        let mut v = vec![0u8; h * 2];
+                        hv.download(&mut v)?;
+                        let hh = v.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, b| (a ^ *b as u64).wrapping_mul(0x100_0000_01b3));
+                        eprintln!("rexl3 event=hnorm layer=head rows=1 hash={hh:016x}");
+                    }
                     dev.lm_head.forward(&hv, &mut s.logits, 1, Dtype::F16, Dtype::F16, &mut s.ws, st)?;
+                    if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() {
+                        st.sync()?;
+                        let mut v = vec![0u8; cfg.vocab * 2];
+                        s.logits.download(&mut v)?;
+                        let hh = v.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, b| (a ^ *b as u64).wrapping_mul(0x100_0000_01b3));
+                        eprintln!("rexl3 event=hlogits layer=head rows=1 hash={hh:016x}");
+                    }
                 }
                 Head::AllRows => {
                     dev.lm_head.forward(&s.hidden, &mut s.logits, n, Dtype::F16, Dtype::F16, &mut s.ws, st)?;
@@ -126,6 +167,7 @@ fn mixer_rope(
     max_pos: usize,
     cos: &DevBuf,
     sin: &DevBuf,
+    layer: usize,
     st: &Stream,
 ) -> Result<(), ModelError> {
     let h = cfg.hidden;
@@ -140,6 +182,49 @@ fn mixer_rope(
     w.kv_a.forward(&s.hidden, &mut s.kv_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st)?;
     gb_cuda::glm_glue::rmsnorm_f16_strided(&s.kv_a, kv_n, &w.kv_a_norm, &mut s.ckv, rows, m.kv_lora_rank, RMS_EPS, st)?;
     mla::latent_write_rope(&s.ckv, &s.kv_a, kv_n, m.kv_lora_rank, cos, sin, mla::ROPE_DIM / 2, ri, table, latent, rows, st)?;
+    if std::env::var_os("REXL3_GLM_CACHE_DUMP").is_some() {
+        // debug: what this layer's cache holds at the rows' own positions (the attention's other input, per rank)
+        let mut slot = vec![0i32; rows];
+        let mut pos = vec![0i32; rows];
+        let mut tbl = vec![0u32; table.slots * table.max_blocks];
+        ri.slot.download(&mut slot)?;
+        ri.pos.download(&mut pos)?;
+        st.sync()?;
+        table.buf.download(&mut tbl)?;
+        st.sync()?;
+        let mut hs: Vec<String> = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let p = pos[r] as usize;
+            let page = tbl[slot[r] as usize * table.max_blocks + p / mla::BLOCK_TOKENS] as usize;
+            let at = (page * mla::BLOCK_TOKENS + p % mla::BLOCK_TOKENS) as usize;
+            let mut v = vec![0u8; mla::LATENT_DIM * 2];
+            latent.lat.download_range(at * mla::LATENT_DIM * 2, &mut v)?;
+            let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+            for b in &v {
+                hsh = (hsh ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            if let Some(rot) = latent.rot.as_ref() {
+                let mut rv = vec![0u8; mla::ROPE_DIM * 2];
+                rot.download_range(at * mla::ROPE_DIM * 2, &mut rv)?;
+                for b in &rv {
+                    hsh = (hsh ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            hs.push(format!("{p}:{hsh:016x}"));
+        }
+        let mut hh = 0xcbf2_9ce4_8422_2325u64;
+        for v in slot.iter().chain(pos.iter()) {
+            for b in v.to_le_bytes() {
+                hh = (hh ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        for v in tbl.iter() {
+            for b in v.to_le_bytes() {
+                hh = (hh ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        eprintln!("rexl3 event=cache_dump layer={layer} rows={rows} ri_table={hh:016x} c={}", hs.join(","));
+    }
     // the indexer: this layer's keys for every row, and the selection when the layer computes it (shared layers reuse the buffer)
     if sparse {
         if let Some((ix, plane)) = idx {
@@ -168,6 +253,16 @@ fn mixer_rope(
         rows,
         st,
     )?;
+    if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() && layer == 0 {
+        // debug: what the attention workspace holds BEFORE its first write (a stale read would depend on it, and it should be zeros)
+        st.sync()?;
+        let n = s.mla.ws.bytes().min(1 << 20);
+        let mut v = vec![0u8; n];
+        s.mla.ws.download_range(0, &mut v)?;
+        let hsh = v.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, b| (a ^ *b as u64).wrapping_mul(0x100_0000_01b3));
+        let nz = v.iter().filter(|b| **b != 0).count();
+        eprintln!("rexl3 event=ws_before layer={layer} bytes={} head_hash={hsh:016x} nonzero={nz}", s.mla.ws.bytes());
+    }
     if sparse {
         // the dense rows read at most the dense limit; the sparse rows read their selection list (<= K_STRIDE entries)
         let dense = stride.min(mla::DENSE_MAX_KEYS);
@@ -178,6 +273,90 @@ fn mixer_rope(
         let dense = stride.min(mla::DENSE_MAX_KEYS);
         mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, dense, dense, &mut s.mla.ws, st)?;
     }
-    w.o.forward(&s.mla.o_lat, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st)?;
+    if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() {
+        // debug: the mixer's two middle tensors, so a layer difference splits into the query/absorb and the attention
+        let mut d = |name: &str, b: &DevBuf| -> Result<(), ModelError> {
+            st.sync()?;
+            let mut v = vec![0u8; rows * m.kv_lora_rank * 2];
+            b.download(&mut v)?;
+            let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+            for x in &v {
+                hsh = (hsh ^ *x as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            eprintln!("rexl3 event={name} layer={layer} rows={rows} hash={hsh:016x}");
+            Ok(())
+        };
+        d("qlat_dump", &s.mla.q_lat)?;
+        st.sync()?;
+        {
+            // the rotated query tail, per head: the attention's other input
+            let heads = cfg.mla.heads;
+            let mut v = vec![0u8; rows * heads * mla::ROPE_DIM * 2];
+            s.qrot.download(&mut v)?;
+            let mut hs: Vec<String> = Vec::with_capacity(heads);
+            for hd in 0..heads {
+                let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+                for r in 0..rows {
+                    let off = (r * heads + hd) * mla::ROPE_DIM * 2;
+                    for b in &v[off..off + mla::ROPE_DIM * 2] {
+                        hsh = (hsh ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+                    }
+                }
+                hs.push(format!("{hsh:016x}"));
+            }
+            eprintln!("rexl3 event=qrot layer={layer} rows={rows} h={}", hs.join(","));
+        }
+        st.sync()?;
+        {
+            // every head's slice of the attention output, so a difference names the head (o_lat is rows x heads x kv_lora)
+            let heads = cfg.mla.heads;
+            let head_count = heads;
+            let dc = m.kv_lora_rank;
+            let mut v = vec![0u8; rows * heads * dc * 2];
+            s.mla.o_lat.download(&mut v)?;
+            let mut hs: Vec<String> = Vec::with_capacity(heads);
+            for hd in 0..heads {
+                let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+                for r in 0..rows {
+                    let off = (r * heads + hd) * dc * 2;
+                    for b in &v[off..off + dc * 2] {
+                        hsh = (hsh ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+                    }
+                }
+                hs.push(format!("{hsh:016x}"));
+            }
+            eprintln!("rexl3 event=oheads layer={layer} rows={rows} h={}", hs.join(","));
+            if layer == 0 {
+                // debug: the same attention again, into fresh buffers (a fresh workspace), so the two results can be compared
+                // within one launch history: equal means the kernel is stable in-engine and the difference is an input
+                let dense2 = (max_pos + 1).min(mla::DENSE_MAX_KEYS);
+                let mut o2 = DevBuf::alloc(rows * heads * dc * 2)?;
+                let mut ws2 = DevBuf::alloc(mla::attend_workspace_bytes(rows, dense2))?;
+                mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut o2, dense2, dense2, &mut ws2, st)?;
+                st.sync()?;
+                let mut v2 = vec![0u8; rows * heads * dc * 2];
+                o2.download(&mut v2)?;
+                let h1 = v.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, b| (a ^ *b as u64).wrapping_mul(0x100_0000_01b3));
+                let h2 = v2.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, b| (a ^ *b as u64).wrapping_mul(0x100_0000_01b3));
+                eprintln!("rexl3 event=attend_again layer={layer} first={h1:016x} second={h2:016x} same={}", h1 == h2);
+            }
+            if layer == 0 {
+                if let Ok(path) = std::env::var("REXL3_GLM_DUMP_FILE") {
+                    // debug: the raw attention output of layer 0, appended, so two ranks' values can be diffed on the host
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                        let mut hdr = Vec::with_capacity(24);
+                        hdr.extend_from_slice(&(rows as u64).to_le_bytes());
+                        hdr.extend_from_slice(&(head_count as u64).to_le_bytes());
+                        hdr.extend_from_slice(&(dc as u64).to_le_bytes());
+                        let _ = std::io::Write::write_all(&mut f, &hdr);
+                        let _ = std::io::Write::write_all(&mut f, &v);
+                    }
+                }
+            }
+        }
+    }
+    // the absorbed latent (kv_lora per head) expands through W_UV to v_head_dim per head: the o_proj's input
+    mla::expand(&s.mla.o_lat, &w.kv_b, &mut s.mla_out, rows, st)?;
+    w.o.forward(&s.mla_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st)?;
     Ok(())
 }

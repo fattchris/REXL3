@@ -910,7 +910,7 @@ async fn start(
         prompt,
         sampling,
         max_new,
-        stop: s.tok.eos.clone(),
+        stop: if p.ignore_eos { Vec::new() } else { s.tok.eos.clone() },
         draft: p.draft,
         images,
         cache: p.prefix_cache,

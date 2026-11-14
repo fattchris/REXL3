@@ -493,11 +493,15 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
     }
 
     if constexpr (ROPE) {
-        // this CTA's head tile's rope queries, [HT][RD], for the rope dot
+        // this CTA's head tile's rope queries, [HT][RD], for the rope dot. Every thread writes one entry of the shared tile and
+        // every warp then reads entries other threads wrote, so the copy is followed by a barrier: without it a warp can reach
+        // the rope dot before another warp's entry landed, and the dot runs on whatever shared memory was there (a NaN there
+        // poisons the score, which the merge treats as "no key" and answers with zeros).
         for (int i = tid; i < HT * RD / 8; i += NTHR) {
             const uint4 v = *reinterpret_cast<const uint4*>(qrot + ((int64_t)row * nh + hb * HT) * RD + i * 8);
             *reinterpret_cast<uint4*>(sqrot + i * 8) = v;
         }
+        __syncthreads();
     }
     // ---- this warp's quarter of the 16 heads' q_lat as A fragments (k16 steps 0..7 of its 128 columns)
     uint32_t qa[DQ / 16][4];
