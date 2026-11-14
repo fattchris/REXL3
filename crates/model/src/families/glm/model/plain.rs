@@ -32,6 +32,21 @@ impl GlmModel {
             let ri = layers::slab_index(&s.rowidx, a, n);
             let ids = s.ids.subview(a * 4, n * 4);
             gb_cuda::glm_mtp::embed_f32(&dev.embed, &ids, &mut x, n, h, cfg.vocab, st)?;
+            if let Ok(path) = std::env::var("REXL3_GLM_TAP_DUMP") {
+                // debug: the embedding itself (layer tag 0xFFFFFFFF), so a tap comparison starts below layer 0
+                st.sync()?;
+                let mut v = vec![0f32; n * h];
+                x.download(&mut v)?;
+                use std::io::Write;
+                let pos0 = b.positions.get(a).copied().unwrap_or(a as i32) as u32;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = f.write_all(&u32::MAX.to_le_bytes());
+                    let _ = f.write_all(&pos0.to_le_bytes());
+                    let _ = f.write_all(&((n as u32).to_le_bytes()));
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    let _ = f.write_all(&bytes);
+                }
+            }
             for (l, layer) in dev.layers.iter().enumerate() {
                 gb_cuda::glm_mtp::rmsnorm_f32_f16(&x, &layer.input_norm, &mut s.hidden, n, h, RMS_EPS, st)?;
                 let MixerDevice::Mla(w) = &layer.mixer else {
@@ -105,6 +120,24 @@ impl GlmModel {
                     }
                 }
                 gb_cuda::glm_mtp::add_f32(&mut x, &s.mixer_out, n * h, st)?;
+                if let Ok(path) = std::env::var("REXL3_GLM_TAP_DUMP") {
+                    // debug: the residual stream after the taps TensorFold's capture records ([5,19,33,47,61,75]), so an oracle
+                    // comparison can say which layer first diverges
+                    if l <= 5 || matches!(l, 19 | 33 | 47 | 61 | 75) {
+                        st.sync()?;
+                        let mut v = vec![0f32; n * h];
+                        x.download(&mut v)?;
+                        use std::io::Write;
+                        let pos0 = b.positions.get(a).copied().unwrap_or(a as i32) as u32;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                            let _ = f.write_all(&((l as u32).to_le_bytes()));
+                            let _ = f.write_all(&pos0.to_le_bytes());
+                            let _ = f.write_all(&((n as u32).to_le_bytes()));
+                            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                            let _ = f.write_all(&bytes);
+                        }
+                    }
+                }
                 if std::env::var_os("REXL3_GLM_LAYER_DUMP").is_some() {
                     // debug: a digest of the last row's residual after each layer, so a rank divergence names its layer
                     let mut v = vec![0f32; n * h];
@@ -352,6 +385,64 @@ fn mixer_rope(
                         let _ = std::io::Write::write_all(&mut f, &v);
                     }
                 }
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("REXL3_GLM_INV_DUMP") {
+        // debug: layer 0's attention output for the first rows, every head, with the rows' positions and the cached latents
+        // those rows read: a host reference (from the pack's own weights) is compared against it
+        if layer == 0 {
+            st.sync()?;
+            let mut slot = vec![0i32; rows];
+            let mut pos = vec![0i32; rows];
+            ri.slot.download(&mut slot)?;
+            ri.pos.download(&mut pos)?;
+            let mut tbl = vec![0u32; table.slots * table.max_blocks];
+            table.buf.download(&mut tbl)?;
+            st.sync()?;
+            let heads = cfg.mla.heads;
+            let dc = m.kv_lora_rank;
+            let take = rows.min(4);
+            let mut o = vec![0u8; take * heads * dc * 2];
+            s.mla.o_lat.download_range(0, &mut o)?;
+            let mut ql = vec![0u8; take * heads * dc * 2];
+            s.mla.q_lat.download_range(0, &mut ql)?;
+            let mut qr = vec![0u8; take * heads * mla::ROPE_DIM * 2];
+            s.qrot.download_range(0, &mut qr)?;
+            let qk = cfg.mla.qk_head_dim();
+            let qres_w = cfg.mla.q_lora_rank;
+            let mut qres = vec![0u8; take * qres_w * 2];
+            s.q_resid.download_range(0, &mut qres)?;
+            let mut qv = vec![0u8; take * heads * qk * 2];
+            s.q.download_range(0, &mut qv)?;
+            let mut hid = vec![0u8; take * h * 2];
+            s.hidden.download_range(0, &mut hid)?;
+            let mut qa_o = vec![0u8; take * qres_w * 2];
+            s.q_a.download_range(0, &mut qa_o)?;
+            let mut rec = Vec::new();
+            rec.extend_from_slice(&(take as u32).to_le_bytes());
+            rec.extend_from_slice(&(heads as u32).to_le_bytes());
+            let mut lats = Vec::new();
+            for r in 0..take {
+                let p = pos[r] as usize;
+                let page = tbl[slot[r] as usize * table.max_blocks + p / mla::BLOCK_TOKENS] as usize;
+                let at = (page * mla::BLOCK_TOKENS + p % mla::BLOCK_TOKENS) as usize;
+                let mut lat = vec![0u8; mla::LATENT_DIM * 2];
+                latent.lat.download_range(at * mla::LATENT_DIM * 2, &mut lat)?;
+                lats.extend_from_slice(&lat);
+                eprintln!("rexl3 event=inv row={r} pos={p}");
+            }
+            rec.extend_from_slice(&o);
+            rec.extend_from_slice(&lats);
+            rec.extend_from_slice(&ql);
+            rec.extend_from_slice(&qr);
+            rec.extend_from_slice(&qres);
+            rec.extend_from_slice(&qv);
+            rec.extend_from_slice(&hid);
+            rec.extend_from_slice(&qa_o);
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                use std::io::Write;
+                let _ = f.write_all(&rec);
             }
         }
     }

@@ -279,5 +279,7 @@ fn the_rope_path_matches_the_host_reference_fp16_and_bf16() {
         one_case(dt, 2, &[-1, 1]);
         let pref: Vec<i32> = (0..18).collect();
         one_case(dt, 18, &pref);
+        let big: Vec<i32> = (0..128).collect();
+        one_case(dt, 128, &big);
     }
 }
