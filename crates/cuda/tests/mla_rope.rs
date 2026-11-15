@@ -521,6 +521,21 @@ fn the_sparse_path_matches_the_host_and_is_gpu_independent() {
     let s = SparseSel { indices: &sel, meta: &meta, stride };
     let wsb = ws.bytes();
     eprintln!("sparse workspace bytes {wsb}");
+    if std::env::var_os("REXL3_SPARSE_PATTERN").is_some() {
+        // fill the workspace with 0xAA, run once, and find where the kernel wrote: the boundaries of po/pm/pl
+        ws.upload(&vec![0xAAu8; wsb]).unwrap();
+        attend_rope_sparse(&q_lat, &qrot, &cache, &table, &ri, &s, rows, &mut o_lat, stride, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        let bytes: Vec<u8> = ws.to_vec().unwrap();
+        let last = bytes.iter().rposition(|b| *b != 0xAAu8);
+        eprintln!("sparse pattern: bytes {wsb}, last written {:?}", last);
+        if let Some(last) = last {
+            // first f32 of each region under the assumed layout, and under a scan for plausible l values
+            let f = |off: usize| -> f32 { f32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]) };
+            eprintln!("  assumed pm at {} -> {:.4}", 4 * (rows * 64 * 9 * 512), f(4 * (rows * 64 * 9 * 512)));
+            eprintln!("  tail f32s: {:?}", (last.saturating_sub(32)..=last).step_by(4).map(|o| f(o)).collect::<Vec<_>>());
+        }
+    }
     let mut got: Vec<u16> = Vec::new();
     let mut bad_at = None;
     for it in 0..60 {
