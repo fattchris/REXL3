@@ -434,6 +434,20 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
                 const bool in = pj >= 0;  // entries past the list's end and holes (< 0): zeros, never read, masked in the fold
                 cp16z(dst + j * PQ + (c ^ (j & 7)), in ? lat + ((int64_t)bj * PAGE + pj % PAGE) * DC + w * DQ + c * 8 : lat, in);
             }
+            if constexpr (ROPE) {
+                // the tile's 64-wide rope keys, at (block, token) of the same keys the lattice staged. Warp 0 stages them and
+                // the wait after commit publishes them to the CTA. The sparse path must stage this tile too: the rope dot reads
+                // it, and returning without staging leaves shared memory that the previous block on this SM left behind.
+                if (w == 0) {
+                    for (int idx = lane; idx < KT * 8; idx += 32) {
+                        const int j = idx / 8, c = idx % 8;
+                        const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
+                        const bool in = pj >= 0;
+                        cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
+                              in ? rot + (((int64_t)bj * PAGE + pj % PAGE) * RD) + c * 8 : rot, in);
+                    }
+                }
+            }
             return;
         }
         const int blk = any ? tbl[key0 / PAGE] : 0;
@@ -460,31 +474,14 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
         }
         if constexpr (ROPE) {
             // the tile's 64-wide rope keys, at (block, token) of the same keys the lattice staged
-            if constexpr (SPARSE) {
-                const int e = key0 + lane;
-                const int pl = (any && e < limit) ? sel_idx[(int64_t)row * sel_stride + e] : -1;
-                const int bl = pl >= 0 ? tbl[pl / PAGE] : 0;
-                const int pj0 = pl;
-                (void)pj0;
-                if (w == 0) {
-                    for (int idx = lane; idx < KT * 8; idx += 32) {
-                        const int j = idx / 8, c = idx % 8;
-                        const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
-                        const bool in = pj >= 0;
-                        cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
-                              in ? rot + (((int64_t)bj * PAGE + pj % PAGE) * RD) + c * 8 : rot, in);
-                    }
-                }
-            } else {
-                const int blk = any ? tbl[key0 / PAGE] : 0;
-                const T* rbase = rot + ((int64_t)blk * PAGE + key0 % PAGE) * RD;
-                if (w == 0) {
-                    for (int idx = lane; idx < KT * 8; idx += 32) {
-                        const int j = idx / 8, c = idx % 8;
-                        const bool in = any && key0 + j < limit;
-                        cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
-                              in ? rbase + (int64_t)j * RD + c * 8 : rot, in);
-                    }
+            const int blk = any ? tbl[key0 / PAGE] : 0;
+            const T* rbase = rot + ((int64_t)blk * PAGE + key0 % PAGE) * RD;
+            if (w == 0) {
+                for (int idx = lane; idx < KT * 8; idx += 32) {
+                    const int j = idx / 8, c = idx % 8;
+                    const bool in = any && key0 + j < limit;
+                    cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
+                          in ? rbase + (int64_t)j * RD + c * 8 : rot, in);
                 }
             }
         }
