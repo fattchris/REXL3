@@ -519,9 +519,24 @@ fn the_sparse_path_matches_the_host_and_is_gpu_independent() {
     let mut o_lat = DevBuf::alloc(rows * hs * LATENT_DIM * 2).unwrap();
     let mut ws = DevBuf::alloc(mla::attend_workspace_bytes(rows, gb_cuda::glm_idx::K_STRIDE)).unwrap();
     let s = SparseSel { indices: &sel, meta: &meta, stride };
-    attend_rope_sparse(&q_lat, &qrot, &cache, &table, &ri, &s, rows, &mut o_lat, stride, &mut ws, &st).unwrap();
-    st.sync().unwrap();
-    let got: Vec<u16> = o_lat.to_vec().unwrap();
+    let wsb = ws.bytes();
+    eprintln!("sparse workspace bytes {wsb}");
+    let mut got: Vec<u16> = Vec::new();
+    let mut bad_at = None;
+    for it in 0..60 {
+        attend_rope_sparse(&q_lat, &qrot, &cache, &table, &ri, &s, rows, &mut o_lat, stride, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        let g: Vec<u16> = o_lat.to_vec().unwrap();
+        // row 0, head 0, first column must be stable
+        if it > 0 && g[0] != got[0] {
+            bad_at = Some((it, got[0], g[0]));
+        }
+        got = g;
+        if bad_at.is_some() { break; }
+    }
+    if let Some((it, a, b)) = bad_at {
+        eprintln!("sparse unstable at iteration {it}: first value {a:#06x} -> {b:#06x}");
+    }
     let mut hsh = 0xcbf2_9ce4_8422_2325u64;
     for b in got.iter().flat_map(|v| v.to_le_bytes()) {
         hsh = (hsh ^ b as u64).wrapping_mul(0x100_0000_01b3);
