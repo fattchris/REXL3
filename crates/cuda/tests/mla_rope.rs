@@ -436,11 +436,9 @@ fn chunk_partials_of_a_two_chunk_row_match_the_host() {
 }
 
 /// The sparse (DSA) attention over a synthetic selection, against the host, and its hash printed: two GPUs running this must
-/// agree bit for bit. `#[ignore]`d because it fails about once in twelve runs on the current kernel: it *finds* a race in the
-/// sparse path (a gross mismatch at one column, not a rounding difference) that is still open. Run it with
-/// `--ignored` (`REXL3_SPARSE_ROWS=<n>` picks the row count).
+/// agree bit for bit. It caught the missing rope-tile stage in the sparse path (worst rel 0.0207 then; 0.0000 after the fix).
+/// `REXL3_SPARSE_ROWS=<n>` picks the row count.
 #[test]
-#[ignore = "exposes an open race in the sparse attention (gross mismatch about once in twelve runs)"]
 fn the_sparse_path_matches_the_host_and_is_gpu_independent() {
     if !device_available() {
         return;
