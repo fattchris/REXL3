@@ -590,7 +590,7 @@ impl GlmModel {
             ("mixer_out", s.mixer_out.bytes() as u64),
             ("kda_qkv", s.kda_qkv.bytes() as u64),
             ("kda_out", s.kda_out.bytes() as u64),
-            ("mla_acts", sum(&[&s.q_a, &s.q_resid, &s.q, &s.kv_a, &s.ckv, &s.mla_out])),
+            ("mla_acts", sum(&[&s.q_a, &s.q_resid, &s.q, &s.kv_a, &s.ckv, &s.mla_out, &s.qrot])),
             ("indexer_acts", sum(&[&s.k_raw, &s.gate, &s.wproj, &s.iq])),
             ("mla_scratch", sum(&[&s.mla.q_lat, &s.mla.o_lat, &s.mla.ws])),
             ("dsa_scratch", s.dsa.bytes() as u64),

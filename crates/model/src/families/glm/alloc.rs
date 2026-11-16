@@ -333,7 +333,8 @@ impl AllocPlan {
         };
         let mla_acts = (m.q_lora_rank * 2
             + m.heads * m.qk_head_dim()
-            + m.kv_lora_rank * 2
+            + kv_a_n(cfg)
+            + m.kv_lora_rank
             + m.heads * m.v_head_dim
             + m.heads * m.qk_rope_head_dim) as u64
             * 2;
