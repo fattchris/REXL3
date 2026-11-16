@@ -155,10 +155,15 @@ __global__ void __launch_bounds__(256) idx_select_kernel(const float* __restrict
     if (tid == 0) meta[2 * r] = n > k ? 1 : 0;
     __shared__ int sw[8];
     __shared__ int stot;
+    __shared__ unsigned long long slo, shi;
+    if (tid == 0) {
+        slo = 0;
+        shi = ~0ULL;
+    }
+    __syncthreads();
     // the k-th largest ordered key: the smallest T with count(key >= T) <= kk (keys are unique, so count(>= T) == kk at the end)
-    unsigned long long lo = 0, hi = ~0ULL;
-    while (hi - lo > 1) {
-        const unsigned long long mid = lo + (hi - lo) / 2;
+    while (shi - slo > 1) {
+        const unsigned long long mid = slo + (shi - slo) / 2;
         int c = 0;
         for (int t = tid; t < n; t += blockDim.x) {
             if (row[t] == -INFINITY) continue;
@@ -168,22 +173,23 @@ __global__ void __launch_bounds__(256) idx_select_kernel(const float* __restrict
         if (lane == 0) sw[wid] = c;
         __syncthreads();
         if (tid == 0) {
-            int s = 0;
-            for (int w = 0; w < blockDim.x / 32; ++w) s += sw[w];
-            stot = s;
+            int sum = 0;
+            for (int w = 0; w < blockDim.x / 32; ++w) sum += sw[w];
+            stot = sum;
         }
         __syncthreads();
         if (tid == 0) {
-            if (stot > kk) lo = mid; else hi = mid;
+            if (stot > kk) slo = mid; else shi = mid;
         }
         __syncthreads();
     }
+    const unsigned long long thr = shi;
     // the selected keys are exactly the kk largest: write their positions in ascending order
     if (tid == 0) {
         int cnt = 0;
         for (int t = 0; t < n; ++t) {
             if (row[t] == -INFINITY) continue;
-            if (order_u(row[t], t) >= hi) out[(int64_t)r * 2056 + cnt++] = t;
+            if (order_u(row[t], t) >= thr) out[(int64_t)r * 2056 + cnt++] = t;
         }
         for (int i = cnt; i < 2056; ++i) out[(int64_t)r * 2056 + i] = -1;
         meta[2 * r + 1] = cnt;
