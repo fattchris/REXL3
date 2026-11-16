@@ -2381,6 +2381,42 @@ impl GlmModel {
         Ok(all[from * v..(from + n) * v].to_vec())
     }
 
+    /// Every row's full-vocabulary logits for `tokens` at positions `start..` (the teacher-forced scoring readout): one f32
+    /// row per token, row i the logits after prompt tokens `0..=i`, unmasked (the sampler's vocabulary mask is not applied).
+    /// The prompt is run in slabs of at most 128 rows; each slab's logits are taken before the next slab overwrites them.
+    pub fn prefill_logits_rows(&mut self, slot: usize, start: usize, tokens: &[u32]) -> Result<Vec<Vec<f32>>, ModelError> {
+        let slab = self.s.rows.min(alloc::MAX_ROWS);
+        let v = self.cfg.vocab;
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+        let mut at = 0usize;
+        while at < tokens.len() {
+            let end = (at + slab).min(tokens.len());
+            let b = RowBatch::from_requests(&[gb_engine::RowRequest {
+                slot,
+                tokens: tokens[at..end].to_vec(),
+                first_position: (start + at) as u64,
+            }]);
+            self.forward(&b, Mode::Prefill, Head::AllRows)?;
+            let rows = self.logits_host(0, end - at)?;
+            for r in 0..(end - at) {
+                let row = &rows[r * v..(r + 1) * v];
+                out.push(row.iter().map(|&x| gb_exl3::f16::f16_to_f64(x) as f32).collect());
+            }
+            at = end;
+        }
+        Ok(out)
+    }
+
+    /// The last row's full-vocabulary logits for `tokens` at positions `start..` (the last row is the one the next token is
+    /// predicted from), f32, unmasked.
+    pub fn prefill_logits_last_row(&mut self, slot: usize, start: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let b = RowBatch::from_requests(&[gb_engine::RowRequest { slot, tokens: tokens.to_vec(), first_position: start as u64 }]);
+        self.forward(&b, Mode::Prefill, Head::LastRow)?;
+        let v = self.cfg.vocab;
+        let row = self.logits_host(0, 1)?;
+        Ok(row[..v].iter().map(|&x| gb_exl3::f16::f16_to_f64(x) as f32).collect())
+    }
+
     /// Candidates for every row of a window step (decode or verify): the window, the head, the top-k.
     pub fn window_candidates(&mut self, b: &RowBatch, count: usize) -> Result<Candidates, ModelError> {
         if count == 0 || count > MAX_CANDIDATES {

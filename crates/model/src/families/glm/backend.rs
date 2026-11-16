@@ -63,6 +63,10 @@ pub struct GlmBackend {
     prefix_pool: bool,
     /// `REXL3_GLM_DIGEST_LOG`: the candidates handed to the engine, per row (host only; off unless set).
     digests: DigestLog,
+    /// A score request asked for every row's logits (`score_all_rows`): keep them for `take_score_rows`.
+    all_rows: bool,
+    /// The rows kept by the last score slice, in prompt order.
+    score_rows: Vec<Vec<f32>>,
 }
 
 /// Whether none of the `rows` positions from `first` is in one of `spans` (the image spans of a prompt): the predicate behind
@@ -99,6 +103,8 @@ impl GlmBackend {
             prefix: None,
             prefix_pool: false,
             digests,
+            all_rows: false,
+            score_rows: Vec::new(),
         }
     }
 
@@ -119,6 +125,8 @@ impl GlmBackend {
             prefix: None,
             prefix_pool: false,
             digests,
+            all_rows: false,
+            score_rows: Vec::new(),
         }
     }
 
@@ -369,6 +377,60 @@ impl Backend for GlmBackend {
     /// The tokenizer's vocabulary: the model's logits are 154,880 wide but the last 24 ids are padding that is never offered.
     fn vocab_size(&self) -> usize {
         TOKENIZER_VOCAB
+    }
+
+    /// The teacher-forced prompt readout (`prompt_logprobs` on /v1/completions, and decisions scoring).
+    fn score_supported(&self) -> bool {
+        true
+    }
+
+    fn score_all_rows(&mut self, on: bool) {
+        self.all_rows = on;
+        self.score_rows.clear();
+    }
+
+    fn take_score_rows(&mut self) -> Vec<Vec<f32>> {
+        std::mem::take(&mut self.score_rows)
+    }
+
+    /// One score slice: prefill `prompt[done..]` with the head read out (every row when the request asked for them, else the
+    /// last row). The GLM family runs no prefix cache, so there are no cuts to honour.
+    fn score_slice(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        done: usize,
+        _cuts: &[usize],
+    ) -> Result<gb_engine::score::ScoreStep, BackendError> {
+        if self.dead() {
+            return Err(self.fatal.clone().unwrap_or_else(|| BackendError::retryable("the backend is dead".to_string())));
+        }
+        let n = prompt.len();
+        let all_rows = self.all_rows;
+        let mut run = || -> Result<Vec<Vec<f32>>, ModelError> {
+            if done == 0 {
+                self.m.begin_slot(slot)?;
+            }
+            if all_rows {
+                self.m.prefill_logits_rows(slot, done, &prompt[done..n])
+            } else {
+                self.m.prefill_logits_last_row(slot, done, &prompt[done..n]).map(|r| vec![r])
+            }
+        };
+        match run() {
+            Ok(rows) => {
+                let last = rows.last().cloned().unwrap_or_default();
+                if all_rows {
+                    self.score_rows.extend(rows);
+                }
+                Ok(gb_engine::score::ScoreStep { done: n, row: Some(last), captured: Vec::new() })
+            }
+            Err(e) => {
+                self.record(&format!("score of slot {slot}"), &e, false);
+                self.drop_slot(slot);
+                Err(self.fatal.clone().unwrap_or_else(|| BackendError::retryable(e.to_string())))
+            }
+        }
     }
 
     fn take_error(&mut self) -> Option<BackendError> {
