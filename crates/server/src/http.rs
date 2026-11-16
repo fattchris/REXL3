@@ -928,7 +928,7 @@ async fn start(
         prompt,
         sampling,
         max_new,
-        stop: s.reply_stop.clone(),
+        stop: if p.ignore_eos { Vec::new() } else { s.reply_stop.clone() },
         draft: p.draft,
         images,
         cache: p.prefix_cache,

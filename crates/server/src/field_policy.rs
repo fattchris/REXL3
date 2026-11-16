@@ -90,9 +90,15 @@ pub fn validate_fields_with(body: &Value, reasoning: &[String]) -> Result<(), Ap
     }
     if let Some(v) = non_null(body, "stream_options") {
         let o = v.as_object().ok_or_else(|| bad("stream_options", "stream_options must be an object"))?;
-        if o.keys().any(|k| k != "include_usage") {
-            return Err(bad("stream_options", "only stream_options.include_usage is supported"));
+        // `continuous_usage_stats` (vLLM/AIPerf clients) is accepted: every chunk's own counts are the client's to take from
+        // the content, and the final usage chunk is the one `include_usage` asks for
+        if o.keys().any(|k| k != "include_usage" && k != "continuous_usage_stats") {
+            return Err(bad("stream_options", "only stream_options.include_usage and continuous_usage_stats are supported"));
         }
+        boolean(v, "continuous_usage_stats", false).map_err(|mut e| {
+            e.param = Some("stream_options".into());
+            e
+        })?;
         boolean(v, "include_usage", false).map_err(|mut e| {
             e.param = Some("stream_options".into());
             e
@@ -143,6 +149,9 @@ pub fn validate_fields_with(body: &Value, reasoning: &[String]) -> Result<(), Ap
         "metadata",
         "store",
         "service_tier",
+        // a benchmark client's decode-length control and LiteLLM's per-request cache bypass
+        "ignore_eos",
+        "cache",
     ];
     for k in obj.keys() {
         if k.len() > 256 {

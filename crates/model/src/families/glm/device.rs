@@ -254,6 +254,16 @@ pub struct GlmDevice {
 struct Binder<'a> {
     regions: &'a Regions,
     moe: MoeDims,
+    mla: MlaDims,
+}
+
+/// The dims the packed `kv_b_proj` split needs (its `uk` and `uvt` halves are equal only when nope == v).
+#[derive(Clone, Copy)]
+struct MlaDims {
+    heads: usize,
+    nope: usize,
+    v: usize,
+    latent: usize,
 }
 
 fn cfg_err(m: String) -> ModelError {
@@ -341,9 +351,18 @@ impl Binder<'_> {
         // no k-pool and is placed as the per-token indexer instead; a shared layer has neither
         let ix = m.indexer.as_ref().filter(|ix| ix.kpool.is_some());
         let full = m.indexer.as_ref().filter(|ix| ix.kpool.is_none());
-        // `kv_b` is the packed copy: `uk` first (64 x 256 x 512 fp16), then `uvt` (64 x 512 x 256 fp16)
+        // `kv_b` is the packed copy: `uk` first (heads x latent x nope fp16), then `uvt` (heads x latent x v fp16); the halves are
+        // equal only for the Flash model (nope == v), so the split is taken from the dims, not from the byte count
         let kvb = self.plain(&m.kv_b_proj)?;
-        let half = kvb.bytes() / 2;
+        let d = self.mla;
+        let uk_bytes = d.heads * d.latent * d.nope * 2;
+        let uvt_bytes = d.heads * d.latent * d.v * 2;
+        if kvb.bytes() != uk_bytes + uvt_bytes {
+            return Err(cfg_err(format!(
+                "layer {index}: packed kv_b_proj has {} bytes, the dims want {uk_bytes} + {uvt_bytes}",
+                kvb.bytes()
+            )));
+        }
         Ok(MlaDevice {
             q_a: self.exl3(&m.q_a_proj)?,
             q_b: self.exl3(&m.q_b_proj)?,
@@ -351,7 +370,7 @@ impl Binder<'_> {
             o: self.exl3(&m.o_proj)?,
             q_a_norm: self.plain(&m.q_a_layernorm)?,
             kv_a_norm: self.plain(&m.kv_a_layernorm)?,
-            kv_b: mla::MlaWeights { uk: kvb.subview(0, half), uvt: kvb.subview(half, half), dtype: Dtype::F16 },
+            kv_b: mla::MlaWeights { uk: kvb.subview(0, uk_bytes), uvt: kvb.subview(uk_bytes, uvt_bytes), dtype: Dtype::F16 },
             full_indexer: match full {
                 Some(ix) => Some(FullIndexerDevice {
                     wq_b: match &ix.wq_b {
@@ -521,8 +540,14 @@ pub fn bind_with(
         scale: cfg.ffn.routed_scaling_factor as f32,
         limit: cfg.ffn.swiglu_limit as f32,
     };
+    let mla_dims = MlaDims {
+        heads: cfg.mla.heads,
+        nope: cfg.mla.qk_nope_head_dim,
+        v: cfg.mla.v_head_dim,
+        latent: cfg.mla.kv_lora_rank,
+    };
     let (embed, final_norm, lm_head, out, mtp) = {
-        let b = Binder { regions: &regions, moe };
+        let b = Binder { regions: &regions, moe, mla: mla_dims };
         let embed = b.plain(&w.embed_tokens)?;
         let final_norm = b.plain(&w.final_norm)?;
         let lm_head = match &w.lm_head {

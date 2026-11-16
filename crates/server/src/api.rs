@@ -58,6 +58,9 @@ pub struct Params {
     pub draft: bool,
     /// `"prefix_cache": false` opts this request out of the prefix cache (nothing is looked up, nothing is stored): the uncached reference path.
     pub prefix_cache: bool,
+    /// `"ignore_eos": true` decodes the full `max_tokens` even past the model's end-of-sequence ids (a benchmark's decode
+    /// measurement wants a fixed number of tokens, not the model's own stopping point).
+    pub ignore_eos: bool,
     /// `prompt_logprobs: k` (0 = off, at most [`MAX_PROMPT_LOGPROBS`]): a teacher-forced pass over the prompt that answers, for
     /// each prompt token after the first, its exact full-vocabulary log-softmax given the tokens before it and that position's
     /// top-`k` token ids and values (vLLM's convention: entry 0 is null, entry `i` scores token `i` from the logits after
@@ -251,7 +254,14 @@ pub fn parse_params_with(body: &Value, d: &GenDefaults, reasoning: &[String]) ->
     let skip_special = crate::field_policy::boolean(body, "skip_special_tokens", true)?;
     let return_token_ids = crate::field_policy::boolean(body, "return_token_ids", false)?;
     let draft = crate::field_policy::boolean(body, "draft", true)?;
-    let prefix_cache = crate::field_policy::boolean(body, "prefix_cache", true)?;
+    let mut prefix_cache = crate::field_policy::boolean(body, "prefix_cache", true)?;
+    // LiteLLM's per-request cache bypass: `"cache": {"no-cache": true}` means "do not serve this from a cache"
+    if let Some(Value::Object(c)) = crate::field_policy::non_null(body, "cache") {
+        if c.get("no-cache").and_then(|v| v.as_bool()).unwrap_or(false) {
+            prefix_cache = false;
+        }
+    }
+    let ignore_eos = crate::field_policy::boolean(body, "ignore_eos", false)?;
     // `prompt_logprobs` is the oracle readout; `top_logprobs` and `logprobs` name the same k for OpenAI clients that set them
     // together (`logprobs: true` alone means k = 1). The sampler-side logprobs of GENERATED tokens are not served.
     let k_of = |v: &Value| -> Option<usize> {
@@ -296,6 +306,7 @@ pub fn parse_params_with(body: &Value, d: &GenDefaults, reasoning: &[String]) ->
         return_token_ids,
         draft,
         prefix_cache,
+        ignore_eos,
         prompt_logprobs,
     })
 }
