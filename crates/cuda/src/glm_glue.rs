@@ -9,6 +9,17 @@ use crate::rt::{CudaError, DevBuf, Stream};
 mod ffi {
     use core::ffi::c_void;
     crate::launchers! {
+        #[allow(clippy::too_many_arguments)]
+        pub fn gb_glm_rmsnorm_f16_strided(
+            x: *const c_void,
+            x_stride: i32,
+            w: *const c_void,
+            y: *mut c_void,
+            rows: i32,
+            dim: i32,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_glm_rmsnorm_f16(x: *const c_void, w: *const c_void, y: *mut c_void, rows: i32, dim: i32, eps: f32, stream: *mut c_void) -> i32;
         pub fn gb_glm_topk_f16_workspace_bytes(rows: i32, valid: i32, count: i32) -> usize;
         pub fn gb_glm_topk_f16(
@@ -34,6 +45,33 @@ fn i32_of(v: usize) -> Result<i32, CudaError> {
 
 /// `y = f16((x * inv) * w)` per row with `inv = 1 / sqrtf(mean(x^2) + eps)`: `x` and `y` fp16 `[rows, dim]`, `w` fp32
 /// `[dim]` as given (GLM's RMSNorm gamma multiplies as it is stored: there is no `+ 1`). `dim % 8 == 0`.
+/// [`rmsnorm_f16`] over the first `dim` columns of rows `x_stride` elements wide (the full model's 640-wide kv_a rows: its first 512
+/// columns are the latent the norm is taken over).
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_f16_strided(
+    x: &DevBuf,
+    x_stride: usize,
+    w: &DevBuf,
+    y: &mut DevBuf,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if x.bytes() < rows.saturating_sub(1) * x_stride * 2 + rows.min(1) * dim * 2
+        || x.bytes() < (rows.saturating_sub(1) * x_stride + dim) * 2
+        || y.bytes() < rows * dim * 2
+        || w.bytes() < dim * 4
+        || x_stride < dim
+    {
+        return Err(CudaError(1));
+    }
+    let rc = unsafe {
+        ffi::gb_glm_rmsnorm_f16_strided(x.ptr(), x_stride as i32, w.ptr(), y.ptr(), rows as i32, dim as i32, eps, st.raw())
+    };
+    CudaError::check(rc)
+}
+
 pub fn rmsnorm_f16(
     x: &DevBuf,
     w: &DevBuf,
