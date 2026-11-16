@@ -466,21 +466,25 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
                 const int bl = pl >= 0 ? tbl[pl / PAGE] : 0;
                 const int pj0 = pl;
                 (void)pj0;
-                for (int idx = lane; idx < KT * 8; idx += 32) {
-                    const int j = idx / 8, c = idx % 8;
-                    const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
-                    const bool in = pj >= 0;
-                    cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
-                          in ? rot + (((int64_t)bj * PAGE + pj % PAGE) * RD) + c * 8 : rot, in);
+                if (w == 0) {
+                    for (int idx = lane; idx < KT * 8; idx += 32) {
+                        const int j = idx / 8, c = idx % 8;
+                        const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
+                        const bool in = pj >= 0;
+                        cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
+                              in ? rot + (((int64_t)bj * PAGE + pj % PAGE) * RD) + c * 8 : rot, in);
+                    }
                 }
             } else {
                 const int blk = any ? tbl[key0 / PAGE] : 0;
                 const T* rbase = rot + ((int64_t)blk * PAGE + key0 % PAGE) * RD;
-                for (int idx = lane; idx < KT * 8; idx += 32) {
-                    const int j = idx / 8, c = idx % 8;
-                    const bool in = any && key0 + j < limit;
-                    cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
-                          in ? rbase + (int64_t)j * RD + c * 8 : rot, in);
+                if (w == 0) {
+                    for (int idx = lane; idx < KT * 8; idx += 32) {
+                        const int j = idx / 8, c = idx % 8;
+                        const bool in = any && key0 + j < limit;
+                        cp16z(reinterpret_cast<uint4*>(srot + st * KT * RD + j * RD) + c,
+                              in ? rbase + (int64_t)j * RD + c * 8 : rot, in);
+                    }
                 }
             }
         }
@@ -524,6 +528,11 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
         if constexpr (MT == 1) {
             wait_group<1>();  // tile t has landed (tile t + 1 may still be in flight)
             __syncwarp();
+            if constexpr (ROPE) {
+                // warp 0 staged the shared rope tile of this stage; the other warps read it, so publish it here (a warp's own
+                // cp.async wait covers only its own copies)
+                __syncthreads();
+            }
         } else {
             wait_group<0>();   // tile t has landed (it is the only group in flight)
             __syncthreads();   // every thread's pieces are visible, and every warp is past the last read of stage (t + 1) & 1
