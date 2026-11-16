@@ -271,6 +271,22 @@ fn mixer_rope(
             glm_idx::select(&s.idx_scores, stride, ri, glm_idx::TOPK, &mut s.idx_sel, &mut s.idx_meta, rows, st)?;
         }
     }
+    if std::env::var_os("REXL3_GLM_SEL_DUMP").is_some() {
+        // debug: the selection buffer this layer left for the attention (the shared layers reuse the full layer's): a hash of
+        // every row's indices and of the two metadata words, so two ranks' selections can be compared directly
+        st.sync()?;
+        let mut sel = vec![0u8; rows * gb_cuda::glm_idx::K_STRIDE * 4];
+        s.idx_sel.download_range(0, &mut sel)?;
+        let mut meta = vec![0u8; rows * 2 * 4];
+        s.idx_meta.download_range(0, &mut meta)?;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in sel.iter().chain(meta.iter()) {
+            h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        let m0 = i32::from_le_bytes([meta[0], meta[1], meta[2], meta[3]]);
+        let m1 = i32::from_le_bytes([meta[4], meta[5], meta[6], meta[7]]);
+        eprintln!("rexl3 event=sel_dump layer={layer} rows={rows} hash={h:016x} meta0={m0},{m1}");
+    }
     mla::absorb_rope(
         &s.q,
         m.heads * qk,
