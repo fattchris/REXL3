@@ -1406,10 +1406,29 @@ pub fn candidates_digest(c: &Candidates) -> u64 {
             h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
         }
     };
+    // `REXL3_TP_TOLERANT_DIGEST`: a bench/debug knob for a family whose kernels are not bit-identical across ranks (the exact
+    // digest is the default): the eight best candidates are compared as a *set* of (id, value rounded to 1/1024) pairs, so an
+    // ordering change or a rounding-level value difference does not lose the group, while a different token set still does.
+    let tolerant = std::env::var_os("REXL3_TP_TOLERANT_DIGEST").is_some();
     eat(&(c.rows as u64).to_le_bytes());
     eat(&(c.count as u64).to_le_bytes());
     let n = c.count.min(8);
     for r in 0..c.rows {
+        if tolerant {
+            let mut set: Vec<(i32, i64)> = Vec::with_capacity(n);
+            for j in 0..n {
+                let at = r * c.count + j;
+                if let (Some(id), Some(v)) = (c.ids.get(at), c.vals.get(at)) {
+                    set.push((*id, (v * 1024.0).round() as i64));
+                }
+            }
+            set.sort_unstable();
+            for (id, q) in set {
+                eat(&id.to_le_bytes());
+                eat(&q.to_le_bytes());
+            }
+            continue;
+        }
         for j in 0..n {
             let at = r * c.count + j;
             if let (Some(id), Some(v)) = (c.ids.get(at), c.vals.get(at)) {
