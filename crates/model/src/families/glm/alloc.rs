@@ -16,6 +16,7 @@
 //! * **scratch**: every activation and workspace buffer of one forward call, sized for `max_rows` rows (the kernels take at most 128 per call).
 
 use super::config::GlmConfig;
+use crate::family::{IndexerMode, Mixer};
 use gb_cuda::exl3_big::big_workspace_bytes;
 use gb_cuda::exl3_linear::{linear_workspace_bytes, Dtype};
 use gb_cuda::kda::{self, Dims};
@@ -256,6 +257,15 @@ impl AllocPlan {
             .collect();
         items.extend([
             Item { name: "mla_latent", bytes: n_mla_state * p.kv_blocks as u64 * LatentCache::block_bytes(Dtype::F16) as u64 },
+            Item {
+                name: "idx_keys",
+                bytes: cfg.layers.iter().filter(|l| matches!(l.mixer, Mixer::MlaDsa { indexer: IndexerMode::Full })).count()
+                    as u64
+                    * p.kv_blocks as u64
+                    * 256
+                    * gb_cuda::glm_idx::D as u64
+                    * 2,
+            },
             Item { name: "dsa_pools", bytes: n_mla_state * dsa::Planes::pool_bytes(p.kv_blocks) as u64 },
             Item { name: "kda_window_records", bytes: n_kda * p.window_rows as u64 * d.record_bytes_per_row() as u64 },
         ]);
@@ -354,6 +364,10 @@ impl AllocPlan {
             sc("kda_out", cr * ch * 2),
             sc("mla_acts", cr * mla_acts),
             sc("indexer_acts", cr * ix_acts),
+            sc("idx_q", cr * gb_cuda::glm_idx::H as u64 * gb_cuda::glm_idx::D as u64 * 2),
+            sc("idx_scores", cr * (max_context as u64 + 1) * 4),
+            sc("idx_sel", cr * gb_cuda::glm_idx::K_STRIDE as u64 * 4),
+            sc("idx_meta", cr * 2 * 4),
             sc("mla_scratch", MlaScratch::bytes(rows, max_context, Dtype::F16) as u64),
             sc("dsa_scratch", dsa::Scratch::bytes_for(max_context) as u64),
             sc("moe_scratch", MoeScratch::bytes_for(&moe, rows).map_err(|e| e.to_string())? as u64),
