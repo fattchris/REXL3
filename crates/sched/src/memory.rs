@@ -248,9 +248,11 @@ impl MemoryProfile {
                 "{f}: {rec_layers} recurrent layers but {state} state bytes per sequence and {records} window-record bytes per row"
             )));
         }
-        if rec_layers == 0 && (state != 0 || records != 0) {
+        // Per-slot state does not have to be a recurrence: a family may hold fixed state per slot (its attention rings, a block table) with no
+        // recurrent layer. Per-row records are snapshots of recurrent state, so they still require one.
+        if rec_layers == 0 && records != 0 {
             return Err(MemoryError::Inconsistent(format!(
-                "{f}: no recurrent layers but {state} state bytes per sequence and {records} window-record bytes per row"
+                "{f}: no recurrent layers but {records} window-record bytes per row"
             )));
         }
         let scratch_bytes = model.scratch_bytes(shape.scratch_rows);

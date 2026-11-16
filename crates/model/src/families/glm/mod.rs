@@ -168,6 +168,69 @@ impl ModelFamily for GlmFamily {
     }
 }
 
+/// The components the full GLM-5.3 text model needs: the MLA with the rotary tail, the indexer (shared selections included), the MoE and the
+/// EXL3 linears. No KDA and no mHC: its layers have neither.
+const REQUIRED_MOE_DSA: &[&str] = &["exl3_linear", "mla_dsa", "moe"];
+
+/// The full GLM-5.3 (`GlmMoeDsaForCausalLM`, model type `glm_moe_dsa`): the Flash family's MLA / indexer / MoE plumbing, without KDA and mHC,
+/// with a 64-wide rotary tail on the MLA and 78 trunk layers. Registered so a full pack probes, binds and prices its plan; the engine refuses to
+/// build it until the rotary path and the plain-residual forward exist (`engine::build_engine`).
+pub struct GlmMoeDsaFamily;
+
+impl ModelFamily for GlmMoeDsaFamily {
+    fn id(&self) -> &'static str {
+        "glm_moe_dsa"
+    }
+    fn architectures(&self) -> &'static [&'static str] {
+        &["GlmMoeDsaForCausalLM"]
+    }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["glm_moe_dsa"]
+    }
+
+    fn probe(&self, dir: &Path) -> Result<FamilyPlan, FamilyError> {
+        let cfg = GlmConfig::from_dir(dir).map_err(FamilyError::Config)?;
+        // a full GLM-5.3 pack is text-only: no `vision_config`, no processor
+        let required: Vec<&'static str> = REQUIRED_MOE_DSA.to_vec();
+        let drafters = if MTP_BUILT && cfg.has_mtp() { vec!["mtp", "copy"] } else { vec!["copy"] };
+        Ok(FamilyPlan {
+            family: self.id(),
+            dir: dir.to_path_buf(),
+            layers: cfg.layers.clone(),
+            mtp_layers: cfg.mtp.clone(),
+            memory: Box::new(GlmMemorySource(cfg)),
+            vision: None,
+            chat_format: "glm5_next",
+            drafters,
+            required_components: required,
+        })
+    }
+
+    fn build(&self, plan: FamilyPlan, ctx: &BuildCtx<'_>) -> Result<Box<dyn ServeEngine>, ModelError> {
+        GlmFamily.build(plan, ctx)
+    }
+
+    fn max_tp_ranks(&self) -> usize {
+        tp::MAX_TP_RANKS
+    }
+
+    fn run_follower(&self, plan: FamilyPlan, ctx: &BuildCtx<'_>) -> Result<(), ModelError> {
+        GlmFamily.run_follower(plan, ctx)
+    }
+
+    fn image_preprocessor(
+        &self,
+        _dir: &Path,
+        _o: &ServeOptions,
+    ) -> Result<Option<std::sync::Arc<dyn gb_vision::preprocessor::ImagePreprocessor>>, ModelError> {
+        Ok(None)
+    }
+
+    fn prefix_cache(&self) -> bool {
+        true
+    }
+}
+
 /// GLM-5.3-Flash's image preprocessing for a server limited to `o.max_image_tokens` tokens an image: the pack's `processor_config.json` read by
 /// `GlmPreprocessing::from_processor_config` in the `Fork` profile (the oracle the tower is validated against: alpha composited on white, PIL bicubic,
 /// numpy normalisation, fp16), with the processor's token budget lowered to the server's limit (the processor shrinks an image to fit a budget, as HF's

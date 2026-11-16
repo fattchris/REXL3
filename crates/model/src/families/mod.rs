@@ -19,6 +19,7 @@ pub mod qwen_flash_next;
 pub static FAMILIES: &[&'static dyn ModelFamily] = &[
     &qwen::QwenFamily,
     &glm::GlmFamily,
+    &glm::GlmMoeDsaFamily,
     &qwen_flash_next::FlashNextFamily,
     &mimo::MiMoFamily,
     &nemotron_h_omni::NemotronOmniFamily,

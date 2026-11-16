@@ -259,6 +259,9 @@ pub struct GlmProcessorConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlmConfig {
     pub hidden: usize,
+    /// The checkpoint prefix of the text model's tensors: `model.language_model.` in the multimodal Flash pack, `model.` in the text-only
+    /// full pack.
+    pub text_prefix: &'static str,
     pub vocab: usize,
     pub rms_eps: f64,
     pub max_positions: usize,
@@ -267,6 +270,10 @@ pub struct GlmConfig {
     /// NextN layers after the trunk (index `layers.len() + i`): empty, or one MLA + indexer + MoE layer on a plain residual.
     pub mtp: Vec<LayerSpec>,
     pub mla: MlaConfig,
+    /// The rotary base of an MLA that carries a rotary tail (`qk_rope_head_dim > 0`), from `rope_parameters.rope_theta`; 0 for the NoPE model.
+    pub rope_theta: f64,
+    /// Whether the rotary pairs are interleaved (`rope_interleave`); false for packs that do not write it.
+    pub rope_interleave: bool,
     pub indexer: IndexerConfig,
     pub kda: KdaConfig,
     pub mhc: MhcConfig,
@@ -560,12 +567,15 @@ impl GlmConfig {
 
         Ok(Self {
             hidden,
+            text_prefix: "model.language_model.",
             vocab,
             rms_eps,
             max_positions: positive(t, tp, "max_position_embeddings")?,
             layers,
             mtp,
             mla,
+            rope_theta: 0.0,
+            rope_interleave: false,
             indexer,
             kda,
             mhc,
@@ -573,6 +583,156 @@ impl GlmConfig {
             eos,
             pad_token_id,
             vision,
+            processor: None,
+        })
+    }
+
+    /// The full GLM-5.3 (`GlmMoeDsaForCausalLM`, model type `glm_moe_dsa`): a flat `config.json`, 78 trunk layers of MLA with a rotary tail
+    /// behind a DeepSeek sparse-attention indexer (one computed every four layers and shared by the next three), no KDA and no mHC, three dense
+    /// layers then 256 routed experts (top 8, sigmoid with a correction bias), and one NextN layer on a plain residual.
+    pub fn from_json_moe_dsa(root: &Value) -> Result<Self, String> {
+        let t = root;
+        let tp = "";
+        let hidden = positive(t, tp, "hidden_size")?;
+        let vocab = positive(t, tp, "vocab_size")?;
+        let n = positive(t, tp, "num_hidden_layers")?;
+        let mlp_types = strings(t, tp, "mlp_layer_types")?;
+        let indexer_types = strings(t, tp, "indexer_types")?;
+        for (name, len) in [("mlp_layer_types", mlp_types.len()), ("indexer_types", indexer_types.len())] {
+            if len != n {
+                return Err(format!("config.json: `{name}` has {len} entries but `num_hidden_layers` is {n}"));
+            }
+        }
+        let first_dense = usize_at(t, tp, "first_k_dense_replace")?;
+        let mut layers = Vec::with_capacity(n);
+        for i in 0..n {
+            let mixer = Mixer::MlaDsa {
+                indexer: match indexer_types[i] {
+                    "full" => IndexerMode::Full,
+                    "shared" => IndexerMode::Shared,
+                    other => return Err(format!("config.json: unsupported indexer type `{other}` at layer {i}")),
+                },
+            };
+            let ffn = match mlp_types[i] {
+                "dense" => Ffn::Dense,
+                "sparse" => Ffn::Moe,
+                other => return Err(format!("config.json: unsupported mlp layer type `{other}` at layer {i}")),
+            };
+            if (ffn == Ffn::Dense) != (i < first_dense) {
+                return Err(format!(
+                    "config.json: `mlp_layer_types` says layer {i} is {} but `first_k_dense_replace` is {first_dense}",
+                    mlp_types[i]
+                ));
+            }
+            layers.push(LayerSpec { mixer, ffn, residual: Residual::Plain });
+        }
+        if let Some(first) = layers.iter().find_map(|l| match l.mixer {
+            Mixer::MlaDsa { indexer } => Some(indexer),
+            _ => None,
+        }) {
+            if first != IndexerMode::Full {
+                return Err("config.json: the first sparse-attention layer cannot share an indexer selection".into());
+            }
+        }
+
+        // ---- MLA with a rotary tail (no compressors, no YaRN)
+        let mla = MlaConfig {
+            heads: positive(t, tp, "num_attention_heads")?,
+            q_lora_rank: positive(t, tp, "q_lora_rank")?,
+            kv_lora_rank: positive(t, tp, "kv_lora_rank")?,
+            qk_nope_head_dim: positive(t, tp, "qk_nope_head_dim")?,
+            qk_rope_head_dim: positive(t, tp, "qk_rope_head_dim")?,
+            v_head_dim: positive(t, tp, "v_head_dim")?,
+        };
+        if usize_at(t, tp, "qk_head_dim")? != mla.qk_head_dim() {
+            return Err("config.json: `qk_head_dim` is not qk_nope_head_dim + qk_rope_head_dim".into());
+        }
+        if usize_at(t, tp, "num_key_value_heads")? != mla.heads {
+            return Err("config.json: `num_key_value_heads` must equal `num_attention_heads` (MLA caches one latent)".into());
+        }
+        let rope = field(t, tp, "rope_parameters")?;
+        let rope_theta = f64_at(rope, "rope_parameters.", "rope_theta")?;
+        if !is_positive(rope_theta) {
+            return Err("config.json: `rope_parameters.rope_theta` must be positive".into());
+        }
+        let rope_interleave = bool_at(t, tp, "rope_interleave")?;
+
+        // ---- the indexer: one key plane per computed layer (no key pooling)
+        let indexer = IndexerConfig {
+            heads: positive(t, tp, "index_n_heads")?,
+            head_dim: positive(t, tp, "index_head_dim")?,
+            topk: positive(t, tp, "index_topk")?,
+            kpool: 0,
+            kpool_always_select_tail: false,
+        };
+
+        // ---- feed-forward blocks and routing
+        expect_str(t, tp, "hidden_act", "silu")?;
+        expect_str(t, tp, "scoring_func", "sigmoid")?;
+        expect_str(t, tp, "topk_method", "noaux_tc")?;
+        expect_true(t, tp, "norm_topk_prob")?;
+        for k in ["n_group", "topk_group"] {
+            if usize_at(t, tp, k)? != 1 {
+                return Err(format!("config.json: `{k}` must be 1 (group-limited routing is not implemented)"));
+            }
+        }
+        let ffn = FfnConfig {
+            dense_intermediate: positive(t, tp, "intermediate_size")?,
+            moe_intermediate: positive(t, tp, "moe_intermediate_size")?,
+            routed_experts: positive(t, tp, "n_routed_experts")?,
+            experts_per_token: positive(t, tp, "num_experts_per_tok")?,
+            shared_experts: usize_at(t, tp, "n_shared_experts")?,
+            routed_scaling_factor: f64_at(t, tp, "routed_scaling_factor")?,
+            swiglu_limit: t.get("swiglu_limit").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        };
+        if ffn.experts_per_token > ffn.routed_experts {
+            return Err("config.json: `num_experts_per_tok` exceeds `n_routed_experts`".into());
+        }
+        if !is_positive(ffn.routed_scaling_factor) || !is_non_negative(ffn.swiglu_limit) {
+            return Err("config.json: `routed_scaling_factor` must be positive and `swiglu_limit` non-negative".into());
+        }
+        let rms_eps = f64_at(t, tp, "rms_norm_eps")?;
+        if !is_positive(rms_eps) {
+            return Err("config.json: `rms_norm_eps` must be positive".into());
+        }
+
+        // ---- the NextN / MTP head: a full MLA + indexer + MoE layer on a plain residual
+        let mtp = match usize_at(t, tp, "num_nextn_predict_layers")? {
+            0 => vec![],
+            1 => vec![LayerSpec { mixer: Mixer::MlaDsa { indexer: IndexerMode::Full }, ffn: Ffn::Moe, residual: Residual::Plain }],
+            k => return Err(format!("config.json: `num_nextn_predict_layers` is {k}; one MTP layer is implemented")),
+        };
+
+        let eos = match t.get("eos_token_id") {
+            Some(Value::Number(x)) => x.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
+            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect(),
+            _ => vec![],
+        };
+        if let Some(bad) = eos.iter().find(|&&id| id as usize >= vocab) {
+            return Err(format!("config.json: eos token {bad} is outside the vocabulary of {vocab}"));
+        }
+        let pad_token_id = t.get("pad_token_id").and_then(|x| x.as_u64()).map(|x| x as u32);
+
+        Ok(Self {
+            hidden,
+            text_prefix: "model.",
+            vocab,
+            rms_eps,
+            max_positions: positive(t, tp, "max_position_embeddings")?,
+            layers,
+            mtp,
+            mla,
+            rope_theta,
+            rope_interleave,
+            indexer,
+            // no KDA layer: the KDA kernels' state and scratch are never allocated (the layer list holds none)
+            kda: KdaConfig { heads: 0, head_dim: 0, conv_kernel: 2, gate_lower_bound: None, rank: None },
+            // no hyper-connections: every residual is plain (`Residual::Plain`)
+            mhc: MhcConfig { streams: 0, sinkhorn_iters: 0, eps: 1.0 },
+            ffn,
+            eos,
+            pad_token_id,
+            vision: None,
             processor: None,
         })
     }
@@ -696,7 +856,12 @@ impl GlmConfig {
             serde_json::from_str(&text).map(Some).map_err(|e| format!("{name}: {e}"))
         };
         let root = read("config.json")?.ok_or_else(|| format!("{}: not found", dir.join("config.json").display()))?;
-        let mut c = Self::from_json(&root)?;
+        // two schemas: the Flash pack nests the text model under `text_config`; the full GLM-5.3 pack (`glm_moe_dsa`) is flat
+        let mut c = if root.get("text_config").is_some() {
+            Self::from_json(&root)?
+        } else {
+            Self::from_json_moe_dsa(&root)?
+        };
         let processor = match read("processor_config.json")? {
             Some(p) => Some(Self::processor_from_json(&p)?),
             None => match read("preprocessor_config.json")? {
@@ -841,6 +1006,43 @@ mod tests {
     use serde_json::json;
 
     const CONFIG: &str = include_str!("../../../../../testdata/glm53/config.json");
+
+    /// The full GLM-5.3 pack's `config.json` (78 layers, flat schema, `glm_moe_dsa`).
+    const CONFIG_MOE_DSA: &str = include_str!("../../../../../testdata/glm53_moe_dsa/config.json");
+
+    #[test]
+    fn the_full_glm_config_is_the_78_layer_composition() {
+        let c = GlmConfig::from_json_moe_dsa(&serde_json::from_str(CONFIG_MOE_DSA).unwrap()).unwrap();
+        assert_eq!((c.hidden, c.vocab, c.layers.len()), (6144, 154_880, 78));
+        assert_eq!(c.dense_layers(), (0..3).collect::<Vec<_>>());
+        assert_eq!(c.moe_layers().len(), 75);
+        // MLA with a 64-wide rotary tail; no KDA, no mHC: every layer is attention with a plain residual
+        assert_eq!(
+            (c.mla.heads, c.mla.qk_nope_head_dim, c.mla.qk_rope_head_dim, c.mla.kv_lora_rank, c.mla.q_lora_rank),
+            (64, 192, 64, 512, 2048)
+        );
+        assert_eq!(c.rope_theta, 8_000_000.0);
+        assert!(c.rope_interleave);
+        assert!(c.kda_layers().is_empty());
+        assert!(c.layers.iter().all(|l| l.residual == Residual::Plain));
+        // the indexer: one computed layer every four (0,1,2 then 6,10,...,74), the next three share its selection
+        let full: Vec<usize> =
+            (0..78).filter(|&i| matches!(c.layers[i].mixer, Mixer::MlaDsa { indexer: IndexerMode::Full })).collect();
+        let mut want = vec![0, 1, 2];
+        want.extend((6..78).step_by(4));
+        assert_eq!(full, want);
+        assert_eq!((c.indexer.heads, c.indexer.head_dim, c.indexer.topk, c.indexer.kpool), (32, 128, 2048, 0));
+        // 256 experts, top 8, three dense layers; one NextN layer on a plain residual
+        assert_eq!(
+            (c.ffn.routed_experts, c.ffn.experts_per_token, c.ffn.dense_intermediate, c.ffn.shared_experts),
+            (256, 8, 12288, 1)
+        );
+        assert_eq!(c.mtp.len(), 1);
+        assert_eq!(c.mtp[0].residual, Residual::Plain);
+        assert_eq!(c.eos, vec![154_820, 154_827, 154_829]);
+        assert!(c.vision.is_none());
+        assert!(c.has_mtp());
+    }
     const PROCESSOR: &str = include_str!("../../../../../testdata/glm53/processor_config.json");
 
     fn real_json() -> Value {
