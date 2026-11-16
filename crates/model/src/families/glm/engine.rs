@@ -232,6 +232,14 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     let pack = GlmPack::from_checkpoint_with(&ck, cfg.clone(), o.vision.is_some())?;
     // the drafter's restricted head, built after the load: charged to the plan now (`draft_head_planned`; the build checks its bytes against it)
     let draft_head = draft_head_planned(with_mtp && o.spec.drafts(), &pack.weights.lm_head, cfg.vocab)?;
+    // the NextN layer's input fusion: an EXL3 group in the Flash pack, a plain fp16 matrix in the full pack. The drafter runs only the
+    // EXL3 form; a plain one refuses here instead of at the first draft.
+    if with_mtp && pack.weights.mtp.iter().any(|m| matches!(m.eh_proj, super::weights::MtpEhProj::PlainF16(_))) {
+        return Err(ModelError::Config(
+            "the NextN layer's eh_proj is a plain fp16 matrix in this pack; the MTP drafter does not run it yet (serve with --no-drafts)"
+                .into(),
+        ));
+    }
     let scan_s = t.elapsed().as_secs_f64();
     boot::mark("packs_scanned", None);
     let target_fingerprint = check_pack(&ck, draft_check_of(o, &cfg)?.as_ref(), o.allow_unvalidated_pack)?;

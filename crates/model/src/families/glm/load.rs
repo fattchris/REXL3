@@ -185,6 +185,30 @@ pub fn convert(x: Xform, src: &[u8]) -> Result<Vec<u8>, String> {
             }
             Ok(out)
         }
+        Xform::Bf16ToF16Exact => {
+            if src.len() % 2 != 0 {
+                return Err(format!("a bf16 tensor of {} bytes", src.len()));
+            }
+            let mut out = Vec::with_capacity(src.len());
+            for (i, c) in src.chunks_exact(2).enumerate() {
+                let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                let h = f64_to_f16(v as f64);
+                if !v.is_finite() || (f16_to_f64(h) as f32).to_bits() != v.to_bits() {
+                    return Err(format!("element {i} ({v:e}) is not exactly representable in fp16; refusing to round it"));
+                }
+                out.extend_from_slice(&h.to_le_bytes());
+            }
+            Ok(out)
+        }
+        Xform::PackKvBBf16 => {
+            let rows = mla::N_HEADS * mla::KV_B_ROWS_PER_HEAD * mla::LATENT_DIM;
+            if src.len() != rows * 2 {
+                return Err(format!("kv_b_proj has {} bytes, expected {}", src.len(), rows * 2));
+            }
+            let bits: Vec<u16> = src.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let (uk, uvt) = mla::pack_kv_b(&bits, Dtype::BF16, Dtype::F16);
+            Ok(uk.iter().chain(uvt.iter()).flat_map(|v| v.to_le_bytes()).collect())
+        }
         Xform::CentredBias => {
             if src.len() % 4 != 0 {
                 return Err(format!("an fp32 bias of {} bytes", src.len()));

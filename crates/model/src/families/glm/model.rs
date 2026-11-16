@@ -715,7 +715,9 @@ impl GlmModel {
             }
         }
         if let Some(w) = self.dev.mtp.as_ref() {
-            lins.push(("the NextN eh_proj".into(), &w.eh_proj));
+            if let super::device::EhProjDevice::Exl3(g) = &w.eh_proj {
+                lins.push(("the NextN eh_proj".into(), g));
+            }
             let a = &*w.mixer;
             for (n, x) in [("q_a", &a.q_a), ("q_b", &a.q_b), ("kv_a", &a.kv_a), ("o", &a.o)] {
                 lins.push((format!("the NextN mla {n}"), x));
@@ -2252,7 +2254,16 @@ impl GlmModel {
                     };
                     match tp.as_mut().filter(|t| t.split_bits() & tp::SPLIT_LM != 0) {
                         // a rank of a vocabulary split: its half of the head, the peer's half swapped in (`model/tp.rs`)
-                        Some(t) => t.split_lm_head(&dev.lm_head, &s.hidden, &mut s.logits, n, &mut s.ws, st)?,
+                        Some(t) => match &dev.lm_head {
+                            super::device::HeadDevice::Exl3(w) => {
+                                t.split_lm_head(w, &s.hidden, &mut s.logits, n, &mut s.ws, st)?
+                            }
+                            super::device::HeadDevice::F16 { .. } => {
+                                return Err(ModelError::Config(
+                                    "a vocabulary-split group needs an EXL3 lm_head; this pack stores a plain fp16 head".into(),
+                                ))
+                            }
+                        },
                         None => dev.lm_head.forward(&s.hidden, &mut s.logits, n, Dtype::F16, Dtype::F16, &mut s.ws, st)?,
                     }
                 }

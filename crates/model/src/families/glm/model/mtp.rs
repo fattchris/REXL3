@@ -764,7 +764,16 @@ impl GlmModel {
         // under the P2 contract a prompt chunk's rows take the P2 GEMM at every width (the drafter's prefill); draft steps never
         let p2 = prefill.p2_prefill(prompt);
         let path = layers::LinPath::of(p2, big);
-        layers::lin(&w.eh_proj, cat, x, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+        match &w.eh_proj {
+            super::super::device::EhProjDevice::Exl3(g) => {
+                layers::lin(g, cat, x, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?
+            }
+            super::super::device::EhProjDevice::F16 { .. } => {
+                return Err(ModelError::Config(
+                    "the NextN layer's eh_proj is a plain fp16 matrix in this pack; the MTP drafter does not run it yet (--no-drafts serves)".into(),
+                ))
+            }
+        }
         mark(1)?;
         if let Some(t) = tail_of(&cap) {
             st.sync()?;

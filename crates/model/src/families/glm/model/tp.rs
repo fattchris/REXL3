@@ -819,10 +819,10 @@ impl GlmModel {
         }
         if bits & SPLIT_LM != 0 {
             let lm = &self.dev.lm_head;
-            if lm.n % 256 != 0 {
-                return cfg_err(format!("the lm_head's {} columns do not halve into 128-column strips", lm.n));
+            if lm.n() % 256 != 0 {
+                return cfg_err(format!("the lm_head's {} columns do not halve into 128-column strips", lm.n()));
             }
-            half_bytes = half_bytes.max(alloc::MAX_ROWS * lm.n / 2 * 2);
+            half_bytes = half_bytes.max(alloc::MAX_ROWS * lm.n() / 2 * 2);
         }
         let mut sh = None;
         if bits & SPLIT_SHARED != 0 {

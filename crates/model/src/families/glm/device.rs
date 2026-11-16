@@ -10,7 +10,8 @@
 use super::config::GlmConfig;
 use super::load::Regions;
 use super::weights::{
-    Exl3Linear, ExpertBank, FfnWeights, GatedMlp, GlmLayerWeights, GlmWeights, HcWeights, IndexerWqB, MixerWeights, PlainTensor,
+    Exl3Linear, ExpertBank, FfnWeights, GatedMlp, GlmLayerWeights, GlmWeights, HcWeights, IndexerWqB, LmHeadWeights, MixerWeights,
+    MtpEhProj, PlainTensor,
 };
 use crate::error::ModelError;
 use gb_cuda::exl3_linear::{Dtype, Exl3Weights};
@@ -153,8 +154,8 @@ pub struct LayerDevice {
 /// indexer + MoE block on a PLAIN residual (no mHC sites), then `shared_head.norm` in front of the trunk's `lm_head`. The norms are fp32
 /// gammas multiplied as stored, like the trunk's.
 pub struct MtpDevice {
-    /// `[2 x hidden -> hidden]`, 4-bit.
-    pub eh_proj: Exl3Weights,
+    /// `[2 x hidden -> hidden]`, EXL3 or a plain fp16 matrix.
+    pub eh_proj: EhProjDevice,
     pub enorm: DevBuf,
     pub hnorm: DevBuf,
     pub shared_head_norm: DevBuf,
@@ -174,13 +175,62 @@ pub enum MtpMoe {
     Subbanks(Box<MoeSubbankLayer>),
 }
 
+/// The trunk's `lm_head` on the device: the EXL3 GEMV, or a plain fp16 matrix run by the fp16 GEMV (`moe::linear_f16`).
+pub enum HeadDevice {
+    Exl3(Exl3Weights),
+    F16 { w: DevBuf, k: usize, n: usize },
+}
+
+impl HeadDevice {
+    /// `y[rows, n] = x[rows, k] * w[n, k]^T` in fp16, the same call the EXL3 GEMV takes.
+    pub fn forward(
+        &self,
+        x: &DevBuf,
+        y: &mut DevBuf,
+        rows: usize,
+        xd: Dtype,
+        yd: Dtype,
+        ws: &mut DevBuf,
+        st: &gb_cuda::Stream,
+    ) -> Result<(), gb_cuda::CudaError> {
+        match self {
+            HeadDevice::Exl3(w) => w.forward(x, y, rows, xd, yd, ws, st),
+            HeadDevice::F16 { w, k, n } => gb_cuda::moe::linear_f16(x, xd, w, y, rows, *k, *n, st),
+        }
+    }
+
+    /// The head's output columns (`vocab`).
+    pub fn n(&self) -> usize {
+        match self {
+            HeadDevice::Exl3(w) => w.n,
+            HeadDevice::F16 { n, .. } => *n,
+        }
+    }
+
+    /// The drafter's share of the head (whole 128-column strips): an EXL3 head only; a plain fp16 head has no strip copy.
+    pub fn select_strips(&self, ranges: &[(usize, usize)]) -> Result<Exl3Weights, ModelError> {
+        match self {
+            HeadDevice::Exl3(w) => w.select_strips(ranges).map_err(ModelError::from),
+            HeadDevice::F16 { .. } => Err(ModelError::Config(
+                "the drafter's restricted head needs an EXL3 lm_head; this pack stores the head as a plain fp16 matrix".into(),
+            )),
+        }
+    }
+}
+
+/// The NextN layer's `eh_proj` on the device: the EXL3 GEMV, or a plain fp16 matrix run by the fp16 GEMV.
+pub enum EhProjDevice {
+    Exl3(Exl3Weights),
+    F16 { w: DevBuf, k: usize, n: usize },
+}
+
 /// Every weight of the text model on the device.
 pub struct GlmDevice {
     /// bf16 `[vocab, hidden]`.
     pub embed: DevBuf,
     /// fp32 `[hidden]`: the final RMSNorm gamma.
     pub final_norm: DevBuf,
-    pub lm_head: Exl3Weights,
+    pub lm_head: HeadDevice,
     pub layers: Vec<LayerDevice>,
     /// The NextN layer, when it was loaded ([`bind_with`] `with_mtp`).
     pub mtp: Option<MtpDevice>,
@@ -386,7 +436,10 @@ impl Binder<'_> {
             FfnDevice::Dense(_) => return Err(cfg_err(format!("layer {} (the NextN layer) has no MoE block", l.index))),
         };
         Ok(MtpDevice {
-            eh_proj: self.exl3(&m.eh_proj)?,
+            eh_proj: match &m.eh_proj {
+                MtpEhProj::Exl3(g) => EhProjDevice::Exl3(self.exl3(g)?),
+                MtpEhProj::PlainF16(t) => EhProjDevice::F16 { w: self.plain(t)?, k: t.shape[1], n: t.shape[0] },
+            },
             enorm: self.plain(&m.enorm)?,
             hnorm: self.plain(&m.hnorm)?,
             shared_head_norm: self.plain(&m.shared_head_norm)?,
@@ -431,7 +484,10 @@ pub fn bind_with(
         let b = Binder { regions: &regions, moe };
         let embed = b.plain(&w.embed_tokens)?;
         let final_norm = b.plain(&w.final_norm)?;
-        let lm_head = b.exl3(&w.lm_head)?;
+        let lm_head = match &w.lm_head {
+            LmHeadWeights::Exl3(g) => HeadDevice::Exl3(b.exl3(g)?),
+            LmHeadWeights::PlainF16(t) => HeadDevice::F16 { w: b.plain(t)?, k: t.shape[1], n: t.shape[0] },
+        };
         let mut out = Vec::with_capacity(layers);
         for l in &w.layers[..layers] {
             out.push(b.layer(l, moe.limit)?);
