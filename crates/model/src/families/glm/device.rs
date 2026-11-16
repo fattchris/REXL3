@@ -212,12 +212,35 @@ impl HeadDevice {
         }
     }
 
+    /// The head's input width (`hidden`).
+    pub fn k(&self) -> usize {
+        match self {
+            HeadDevice::Exl3(w) => w.k,
+            HeadDevice::F16 { k, .. } => *k,
+        }
+    }
+
     /// The head's output columns (`vocab`).
     pub fn n(&self) -> usize {
         match self {
             HeadDevice::Exl3(w) => w.n,
             HeadDevice::F16 { n, .. } => *n,
         }
+    }
+
+    /// The EXL3 group, when the head is not a plain fp16 matrix.
+    pub fn as_exl3(&self) -> Result<&Exl3Weights, ModelError> {
+        match self {
+            HeadDevice::Exl3(w) => Ok(w),
+            HeadDevice::F16 { .. } => Err(ModelError::Config(
+                "this path needs an EXL3 lm_head; this pack stores the head as a plain fp16 matrix".into(),
+            )),
+        }
+    }
+
+    /// The EXL3 head's bits (the DFlash2 draft's target-head format).
+    pub fn exl3_bits(&self) -> Result<usize, ModelError> {
+        self.as_exl3().map(|w| w.bits)
     }
 
     /// The drafter's share of the head (whole 128-column strips): an EXL3 head only; a plain fp16 head has no strip copy.

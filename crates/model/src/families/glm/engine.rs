@@ -51,10 +51,15 @@ pub const MTP_VOCAB_MIN_SHARE: f32 = 0.9;
 /// What the NextN drafter's restricted head will allocate (`model::sub_head_bytes`) in a process that drafts with the NextN layer (`drafts`), under
 /// `REXL3_MTP_VOCAB` ([`mtp_vocab_setting`]), for the pack's `lm_head`: 0 when no restricted head is built. Both planners take it out of the room
 /// before the KV pool is sized (it was left to the headroom before: about 0.23 GiB at the default size, allocated after the plan was checked).
-pub fn draft_head_planned(drafts: bool, lm_head: &super::weights::Exl3Linear, vocab: usize) -> Result<u64, ModelError> {
+pub fn draft_head_planned(drafts: bool, lm_head: &super::weights::LmHeadWeights, vocab: usize) -> Result<u64, ModelError> {
     if !drafts {
         return Ok(0);
     }
+    let super::weights::LmHeadWeights::Exl3(lm_head) = lm_head else {
+        return Err(ModelError::Config(
+            "the NextN drafter's restricted head needs an EXL3 lm_head; this pack stores the head as a plain fp16 matrix".into(),
+        ));
+    };
     let setting = mtp_vocab_setting(std::env::var("REXL3_MTP_VOCAB").ok().as_deref()).map_err(ModelError::Config)?;
     let bits = lm_head.bits.twice() as usize / 2;
     Ok(setting.map_or(0, |(strips, _)| super::model::sub_head_bytes(lm_head.k, bits, &super::model::vocab_ranges(strips, vocab))))
@@ -332,7 +337,7 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     // planned from. The trunk's tap buffer is allocated with the model below.
     let chunk = alloc::prefill_chunk_for(o.prefill_chunk);
     let draft = match draft_dir {
-        Some(dir) => Some(load_draft(dir, &cfg, booted.device.lm_head.bits, o.slots, chunk, o.floor_bytes)?),
+        Some(dir) => Some(load_draft(dir, &cfg, booted.device.lm_head.exl3_bits()?, o.slots, chunk, o.floor_bytes)?),
         None => None,
     };
 

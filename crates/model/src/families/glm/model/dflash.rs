@@ -93,10 +93,10 @@ impl GlmModel {
             return Err(ModelError::Config(format!("the draft taps layers {TAP_LAYERS:?} of a model of {} layers", self.layers)));
         }
         // the draft's head is this model's whole lm_head (a rank of a group holds it whole and only computes its strips: `model/tp.rs`)
-        if (self.dev.lm_head.k, self.dev.lm_head.n) != (self.cfg.hidden, self.cfg.vocab) {
+        if (self.dev.lm_head.k(), self.dev.lm_head.n()) != (self.cfg.hidden, self.cfg.vocab) {
             return Err(ModelError::Config(format!(
                 "the DFlash2 draft's head is the target's lm_head, and this model holds {}x{} of {}x{}",
-                self.dev.lm_head.k, self.dev.lm_head.n, self.cfg.hidden, self.cfg.vocab
+                self.dev.lm_head.k(), self.dev.lm_head.n(), self.cfg.hidden, self.cfg.vocab
             )));
         }
         let rows = self.s.rows.max(self.window_rows);
@@ -252,9 +252,10 @@ impl GlmModel {
             .collect();
         let GlmModel { dflash, dev, stream, cfg, .. } = self;
         let d = dflash.as_mut().expect("checked by dflash_ready");
+        let head = dev.lm_head.as_exl3()?;
         let mut out = Vec::with_capacity(reqs.len());
         for chunk in reqs.chunks(d.draft.max_seqs) {
-            for mut t in d.draft.propose_batch(&dev.embed, &dev.lm_head, cfg.vocab, chunk, stream)? {
+            for mut t in d.draft.propose_batch(&dev.embed, head, cfg.vocab, chunk, stream)? {
                 if let Some(cut) = t.iter().position(|&x| x as usize >= TOKENIZER_VOCAB) {
                     t.truncate(cut);
                 }

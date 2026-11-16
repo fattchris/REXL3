@@ -1136,7 +1136,7 @@ impl GlmModel {
         let map = DevBuf::from_slice(&map)?;
         let bytes = w.weight_bytes() + ws.bytes() + logits.bytes() + map.bytes();
         // what the planners charged for it: an allocation that differs is a planning bug, refused by name rather than run past the plan
-        let planned = sub_head_bytes(self.dev.lm_head.k, self.dev.lm_head.bits, ranges);
+        let planned = sub_head_bytes(w.k, w.bits, ranges);
         if bytes as u64 != planned {
             return Err(ModelError::Config(format!(
                 "the draft head's vocabulary strips allocate {bytes} bytes, the memory plan charged {planned} (plan != allocations)"
