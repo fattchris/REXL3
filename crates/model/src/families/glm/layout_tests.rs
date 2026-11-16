@@ -102,7 +102,8 @@ fn the_layer_recipe_decides_the_slots() {
     assert_eq!(m.layer.index, 45);
     assert!(m.layer.mhc.is_none(), "the MTP layer has a plain residual: no hc tensors");
     assert!(matches!(m.layer.mixer, MixerWeights::Mla(_)) && matches!(m.layer.ffn, FfnWeights::Moe(_)));
-    assert_eq!((m.eh_proj.k, m.eh_proj.n), (8192, 4096));
+    let crate::families::glm::weights::MtpEhProj::Exl3(eh) = &m.eh_proj else { panic!("the pack's eh_proj is an EXL3 group") };
+    assert_eq!((eh.k, eh.n), (8192, 4096));
 }
 
 #[test]
@@ -129,7 +130,8 @@ fn shapes_and_dtypes_come_from_the_config_and_match_the_pack() {
     assert_eq!((hc.fn_.shape.clone(), hc.base.shape.clone(), hc.scale.shape.clone()), (vec![24, 16384], vec![24], vec![3]));
     let FfnWeights::Dense(d) = &w.layers[0].ffn else { panic!("layer 0 is dense") };
     assert_eq!((d.gate_proj.k, d.gate_proj.n, d.down_proj.k), (4096, 12288, 12288));
-    assert_eq!((w.lm_head.k, w.lm_head.n, w.lm_head.bits.as_f64()), (4096, 154_880, 6.0));
+    let crate::families::glm::weights::LmHeadWeights::Exl3(head) = &w.lm_head else { panic!("the pack's head is an EXL3 group") };
+    assert_eq!((head.k, head.n, head.bits.as_f64()), (4096, 154_880, 6.0));
     assert_eq!(w.embed_tokens.shape, vec![154_880, 4096]);
 }
 
