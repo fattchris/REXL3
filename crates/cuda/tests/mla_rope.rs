@@ -537,17 +537,28 @@ fn the_sparse_path_matches_the_host_and_is_gpu_independent() {
         }
     }
     let mut got: Vec<u16> = Vec::new();
+    let mut prev_ws: Vec<u8> = Vec::new();
     let mut bad_at = None;
+    let mut ws_moved = None;
     for it in 0..60 {
         attend_rope_sparse(&q_lat, &qrot, &cache, &table, &ri, &s, rows, &mut o_lat, stride, &mut ws, &st).unwrap();
         st.sync().unwrap();
         let g: Vec<u16> = o_lat.to_vec().unwrap();
-        // row 0, head 0, first column must be stable
+        let w = ws.to_vec::<u8>().unwrap();
+        // row 0, head 0, first column must be stable; and so must every byte the partial kernel wrote
         if it > 0 && g[0] != got[0] {
             bad_at = Some((it, got[0], g[0]));
         }
+        if it > 0 && w != prev_ws {
+            let off = w.iter().zip(prev_ws.iter()).position(|(a, b)| a != b).unwrap_or(0);
+            ws_moved = Some((it, off, w[off], prev_ws[off]));
+        }
         got = g;
+        prev_ws = w;
         if bad_at.is_some() { break; }
+    }
+    if let Some((it, off, a, b)) = ws_moved {
+        eprintln!("sparse workspace changed at iteration {it}: first byte {off} {a:#04x} -> {b:#04x}");
     }
     if let Some((it, a, b)) = bad_at {
         eprintln!("sparse unstable at iteration {it}: first value {a:#06x} -> {b:#06x}");
