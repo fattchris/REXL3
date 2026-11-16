@@ -169,11 +169,14 @@ fn mixer_rope(
         st,
     )?;
     if sparse {
-        mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, mla::DENSE_MAX_KEYS, stride, &mut s.mla.ws, st)?;
+        // the dense rows read at most the dense limit; the sparse rows read their selection list (<= K_STRIDE entries)
+        let dense = stride.min(mla::DENSE_MAX_KEYS);
+        mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, dense, dense, &mut s.mla.ws, st)?;
         let sel = mla::SparseSel { indices: &s.idx_sel, meta: &s.idx_meta, stride: K_STRIDE };
-        mla::attend_rope_sparse(&s.mla.q_lat, &s.qrot, latent, table, ri, &sel, rows, &mut s.mla.o_lat, stride, &mut s.mla.ws, st)?;
+        mla::attend_rope_sparse(&s.mla.q_lat, &s.qrot, latent, table, ri, &sel, rows, &mut s.mla.o_lat, K_STRIDE, &mut s.mla.ws, st)?;
     } else {
-        mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, stride, stride, &mut s.mla.ws, st)?;
+        let dense = stride.min(mla::DENSE_MAX_KEYS);
+        mla::attend_rope(&s.mla.q_lat, &s.qrot, latent, table, ri, rows, &mut s.mla.o_lat, dense, dense, &mut s.mla.ws, st)?;
     }
     w.o.forward(&s.mla.o_lat, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st)?;
     Ok(())
