@@ -183,8 +183,56 @@ pub fn pack_kv_b(rows: &[u16], src: Dtype, dst: Dtype) -> (Vec<u16>, Vec<u16>) {
     (uk, uvt)
 }
 
+/// [`pack_kv_b`] for the full model: `kv_b_proj` is `[heads * (192 + 256)][512]` (nope 192, v 256); rows `h * 448 + d` are
+/// `W_UK[h][d]` for `d < 192`, and `h * 448 + 192 + n` is `W_UV[h][n]`.
+pub fn pack_kv_b_full(rows: &[u16], src: Dtype, dst: Dtype) -> (Vec<u16>, Vec<u16>) {
+    let rph = NOPE_DIM_FULL + NOPE_DIM; // 448 rows per head
+    assert_eq!(rows.len(), N_HEADS * rph * LATENT_DIM, "kv_b_proj must be [64*448][512]");
+    let mut uk = vec![0u16; N_HEADS * NOPE_DIM_FULL * LATENT_DIM];
+    let mut uvt = vec![0u16; N_HEADS * LATENT_DIM * NOPE_DIM];
+    for h in 0..N_HEADS {
+        for d in 0..NOPE_DIM_FULL {
+            let k_row = &rows[(h * rph + d) * LATENT_DIM..][..LATENT_DIM];
+            for (c, &v) in k_row.iter().enumerate() {
+                uk[(h * NOPE_DIM_FULL + d) * LATENT_DIM + c] = convert(v, src, dst);
+            }
+        }
+        for n in 0..NOPE_DIM {
+            let v_row = &rows[(h * rph + NOPE_DIM_FULL + n) * LATENT_DIM..][..LATENT_DIM];
+            for (c, &v) in v_row.iter().enumerate() {
+                uvt[(h * LATENT_DIM + c) * NOPE_DIM + n] = convert(v, src, dst);
+            }
+        }
+    }
+    (uk, uvt)
+}
+
 impl MlaWeights {
-    /// Uploads `kv_b_proj.weight` (see [`pack_kv_b`]).
+    /// [`pack_kv_b`] for the full model: `kv_b_proj` is `[heads * (192 + 256)][512]` (nope 192, v 256), rows `h * 448 + d` are
+/// `W_UK[h][d]` for `d < 192` and `h * 448 + 192 + n` is `W_UV[h][n]`.
+pub fn pack_kv_b_full(rows: &[u16], src: Dtype, dst: Dtype) -> (Vec<u16>, Vec<u16>) {
+    let rph = NOPE_DIM_FULL + NOPE_DIM; // 448 rows per head, fp16
+    assert_eq!(rows.len(), N_HEADS * rph * LATENT_DIM, "kv_b_proj must be [64*448][512]");
+    let mut uk = vec![0u16; N_HEADS * NOPE_DIM_FULL * LATENT_DIM];
+    let mut uvt = vec![0u16; N_HEADS * LATENT_DIM * NOPE_DIM];
+    for h in 0..N_HEADS {
+        for d in 0..NOPE_DIM_FULL {
+            let k_row = &rows[(h * rph + d) * LATENT_DIM..][..LATENT_DIM];
+            for (c, &v) in k_row.iter().enumerate() {
+                uk[(h * NOPE_DIM_FULL + d) * LATENT_DIM + c] = convert(v, src, dst);
+            }
+        }
+        for n in 0..NOPE_DIM {
+            let v_row = &rows[(h * rph + NOPE_DIM_FULL + n) * LATENT_DIM..][..LATENT_DIM];
+            for (c, &v) in v_row.iter().enumerate() {
+                uvt[(h * LATENT_DIM + c) * NOPE_DIM + n] = convert(v, src, dst);
+            }
+        }
+    }
+    (uk, uvt)
+}
+
+/// Uploads `kv_b_proj.weight` (see [`pack_kv_b`]).
     pub fn from_kv_b(rows: &[u16], src: Dtype, dst: Dtype) -> Result<Self, CudaError> {
         check_dtype(dst);
         let (uk, uvt) = pack_kv_b(rows, src, dst);

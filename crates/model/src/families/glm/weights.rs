@@ -92,6 +92,10 @@ pub enum Xform {
     Bf16ToF16Exact,
     /// `kv_b_proj` stored bf16: the same split and pack as [`Xform::PackKvB`], converted to fp16 on the way.
     PackKvBBf16,
+    /// `kv_b_proj` of the full model (`[64 * (192 + 256)][512]`): split and packed for the rope MLA kernels, fp16 source.
+    PackKvBFull,
+    /// [`Xform::PackKvBFull`] from a bf16 source.
+    PackKvBFullBf16,
     /// The router's selection bias: fp32 `[experts]` minus its mean (torch's reduction order), rounded to fp16, as fp32
     /// (`gb_cuda::moe::centred_bias_host`), the arithmetic the oracle applies at load.
     CentredBias,
@@ -114,11 +118,14 @@ impl Xform {
     pub fn dst_bytes(self, src_bytes: u64) -> u64 {
         match self {
             Xform::Bf16ToF32 => src_bytes * 2,
-            Xform::F32ToF16Exact | Xform::Bf16ToF16Exact => src_bytes / 2,
+            Xform::F32ToF16Exact => src_bytes / 2,
+            Xform::Bf16ToF16Exact => src_bytes,
             Xform::None
             | Xform::CentredBias
             | Xform::PackKvB
             | Xform::PackKvBBf16
+            | Xform::PackKvBFull
+            | Xform::PackKvBFullBf16
             | Xform::FoldPatchF16
             | Xform::PermuteDownsampleF16 => src_bytes,
         }

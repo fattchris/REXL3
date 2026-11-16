@@ -227,7 +227,8 @@ impl ModelFamily for GlmMoeDsaFamily {
     }
 
     fn prefix_cache(&self) -> bool {
-        true
+        // the plain-residual trunk has no prefix snapshots yet
+        false
     }
 }
 

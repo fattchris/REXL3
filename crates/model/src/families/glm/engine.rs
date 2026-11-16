@@ -251,7 +251,8 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     boot::mark("cuda_ready", None);
     crate::serve::boot_checkpoint()?;
 
-    let layers = cfg.layers.len();
+    // dev knob for the port's smoke tests: load and run only the first layers (the weights beyond them stay unread)
+    let layers = std::env::var("REXL3_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(cfg.layers.len()).min(cfg.layers.len());
     let lo = LoadOptions::from_env(o.floor_bytes);
     loadstats::set_component(Component::Target);
     boot::mark("target_loading", None);
@@ -472,8 +473,17 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     }
     loadstats::phase_end(ph);
     // the plan the admission was priced with is what was allocated: say so loudly if it is not (a bug in the memory model, never a property of the pack)
+    // the dev layer limit runs a prefix of the trunk: the plan it is checked against is that prefix's
+    let plan_cfg = if layers < cfg.layers.len() {
+        let mut c = cfg.clone();
+        c.layers.truncate(layers);
+        c.mtp.clear();
+        c
+    } else {
+        cfg.clone()
+    };
     let ap = AllocPlan::new_chunked(
-        &cfg,
+        &plan_cfg,
         &AllocParams {
             slots,
             kv_blocks: pool_blocks,

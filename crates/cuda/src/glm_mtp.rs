@@ -33,6 +33,15 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn gb_glm_add_f32(x: *mut c_void, y: *const c_void, n: i64, stream: *mut c_void) -> i32;
+        pub fn gb_glm_embed_f32(
+            table: *const c_void,
+            ids: *const i32,
+            out: *mut c_void,
+            rows: i32,
+            vocab: i32,
+            dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_glm_keyed_pick(
             ids: *const i32,
             vals: *const f32,
@@ -167,6 +176,28 @@ pub fn add_rmsnorm_f32(
     // SAFETY: as above
     let rc = unsafe {
         ffi::gb_glm_add_rmsnorm_f32(x.ptr(), y.ptr(), w.ptr(), y_out.ptr(), i32_of(rows)?, i32_of(dim)?, eps, st.raw())
+    };
+    CudaError::check(rc)
+}
+
+/// `out[r][c] = f32(embed[id[r]][c])`: the embedding rows of a plain-residual trunk as the fp32 residual stream.
+pub fn embed_f32(
+    table: &DevBuf,
+    ids: &DevBuf,
+    out: &mut DevBuf,
+    rows: usize,
+    dim: usize,
+    vocab: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if rows == 0 {
+        return Ok(());
+    }
+    if ids.bytes() < rows * 4 || out.bytes() < rows * dim * 4 || table.bytes() < vocab * dim * 2 {
+        return Err(CudaError(1));
+    }
+    let rc = unsafe {
+        ffi::gb_glm_embed_f32(table.ptr(), ids.ptr() as *const i32, out.ptr(), rows as i32, vocab as i32, dim as i32, st.raw())
     };
     CudaError::check(rc)
 }

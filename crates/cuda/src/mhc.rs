@@ -179,6 +179,13 @@ pub struct MhcSite {
     pub scale: DevBuf,
 }
 
+impl MhcSite {
+    /// A site for a layer whose residuals are plain (the full model): never read, so the buffers may be tiny.
+    pub fn empty() -> Result<Self, CudaError> {
+        Ok(MhcSite { fn_buf: DevBuf::alloc(4)?, fn_ty: Ty::F16, base: DevBuf::alloc(4)?, scale: DevBuf::alloc(4)? })
+    }
+}
+
 /// Narrowest lossless type for `fnw` (fp16 preferred: it is what the ExLlamaV3 decode path uses), and whether each type is exact.
 pub fn lossless_types(fnw: &[f32]) -> (bool, bool) {
     let mut f16 = true;
