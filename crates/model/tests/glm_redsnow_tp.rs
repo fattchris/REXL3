@@ -208,7 +208,7 @@ fn check_wq_b(dir: &Path, dev: &GlmDevice) {
         .layers
         .iter()
         .find_map(|l| match &l.mixer {
-            MixerDevice::Mla(m) => Some((l.index, &m.indexer.wq_b)),
+            MixerDevice::Mla(m) => m.indexer.as_ref().map(|ix| (l.index, &ix.wq_b)),
             MixerDevice::Kda(_) => None,
         })
         .expect("an MLA layer in the prefix");

@@ -173,6 +173,48 @@ fn one_case(dt: Dtype, rows: usize, pos: &[i32]) {
     st.sync().unwrap();
     let o_out: Vec<u16> = o_lat.to_vec().unwrap();
 
+    // the workspace's prior content must not reach the output: fill it with two different patterns and compare (the engine
+    // reuses one workspace across layers and ranks, so a stale read shows up as a rank divergence there)
+    {
+        let n = ws.bytes();
+        let mut junk: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(37) ^ 0x5a) as u8).collect();
+        ws.upload(&junk).unwrap();
+        attend_rope(&q_lat, &qrot, &cache, &table, &ri, rows, &mut o_lat, max_pos, max_pos, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        let first: Vec<u16> = o_lat.to_vec().unwrap();
+        junk.reverse();
+        ws.upload(&junk).unwrap();
+        attend_rope(&q_lat, &qrot, &cache, &table, &ri, rows, &mut o_lat, max_pos, max_pos, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        let second: Vec<u16> = o_lat.to_vec().unwrap();
+        assert_eq!(first, second, "attend_rope depends on the workspace's prior content (rows {rows}, max_pos {max_pos})");
+    }
+
+    // a shared-memory poison: run the kernel once with NaN queries (which fills the CTAs' shared buffers with NaN), restore
+    // the real queries, and run again. A byte of shared memory the kernel reads without writing shows up as a NaN here.
+    {
+        let nan_q: Vec<u16> = (0..q_lat_out.len()).map(|i| if i % 3 == 0 { 0x7e00u16 } else { q_lat_out[i] }).collect();
+        q_lat.upload(&nan_q).unwrap();
+        attend_rope(&q_lat, &qrot, &cache, &table, &ri, rows, &mut o_lat, max_pos, max_pos, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        q_lat.upload(&q_lat_out).unwrap();
+        attend_rope(&q_lat, &qrot, &cache, &table, &ri, rows, &mut o_lat, max_pos, max_pos, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        let poisoned: Vec<u16> = o_lat.to_vec().unwrap();
+        let nan_out = poisoned.iter().filter(|v| (0x7c00u16..=0x7fffu16).contains(&(**v & 0x7fffu16))).count();
+        assert_eq!(nan_out, 0, "attend_rope read shared memory it never wrote (rows {rows}, max_pos {max_pos})");
+        assert_eq!(poisoned, o_out, "attend_rope changed after a NaN run (rows {rows}, max_pos {max_pos})");
+    }
+
+    // the same call again on the same buffers: identical inputs must give identical bits (a rank divergence in the
+    // engine starts as a difference here, with every input already proven equal by the dumps)
+    for k in 0..16 {
+        attend_rope(&q_lat, &qrot, &cache, &table, &ri, rows, &mut o_lat, max_pos, max_pos, &mut ws, &st).unwrap();
+        st.sync().unwrap();
+        let again: Vec<u16> = o_lat.to_vec().unwrap();
+        assert_eq!(again, o_out, "attend_rope differs on repeat {k} (rows {rows}, max_pos {max_pos})");
+    }
+
     let scale = 1.0f32 / 16.0; // 256^-0.5
     for row in 0..rows {
         if pos[row] < 0 {
@@ -235,5 +277,7 @@ fn the_rope_path_matches_the_host_reference_fp16_and_bf16() {
         one_case(dt, 1, &[2]);
         one_case(dt, 2, &[0, 3]);
         one_case(dt, 2, &[-1, 1]);
+        let pref: Vec<i32> = (0..18).collect();
+        one_case(dt, 18, &pref);
     }
 }
