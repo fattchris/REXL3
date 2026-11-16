@@ -70,12 +70,16 @@ constexpr int RMS_NT = 256;
 
 __global__ void __launch_bounds__(RMS_NT) rmsnorm_f16_k(const u16* x, int x_stride, const float* w, u16* y, int dim, float eps) {
     __shared__ float sm[RMS_NT / 32];
-    const size_t base = (size_t)blockIdx.x * x_stride;
+    // the input rows are `x_stride` elements apart (the full model's kv_a rows are 640 wide, its latent 512), the output rows
+    // are `dim` apart (`y` is the compact rows x dim latent buffer): one stride for both wrote row r >= 1 at x_stride, over
+    // the previous row's tail and past the buffer
+    const size_t xbase = (size_t)blockIdx.x * x_stride;
+    const size_t ybase = (size_t)blockIdx.x * (size_t)dim;
     const int nvec = dim / 8;
     float ss = 0.f;
     for (int v = threadIdx.x; v < nvec; v += RMS_NT) {
         float f[8];
-        unpack8h(*(const uint4*)(x + base + (size_t)v * 8), f);
+        unpack8h(*(const uint4*)(x + xbase + (size_t)v * 8), f);
 #pragma unroll
         for (int i = 0; i < 8; ++i) ss = ss + f[i] * f[i];
     }
@@ -83,12 +87,12 @@ __global__ void __launch_bounds__(RMS_NT) rmsnorm_f16_k(const u16* x, int x_stri
     const float inv = 1.0f / sqrtf(ss / (float)dim + eps);
     for (int v = threadIdx.x; v < nvec; v += RMS_NT) {
         float f[8], o[8];
-        unpack8h(*(const uint4*)(x + base + (size_t)v * 8), f);
+        unpack8h(*(const uint4*)(x + xbase + (size_t)v * 8), f);
         const float4 w0 = *(const float4*)(w + (size_t)v * 8), w1 = *(const float4*)(w + (size_t)v * 8 + 4);
         const float wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
 #pragma unroll
         for (int i = 0; i < 8; ++i) o[i] = (f[i] * inv) * wv[i];
-        *(uint4*)(y + base + (size_t)v * 8) = pack8h(o);
+        *(uint4*)(y + ybase + (size_t)v * 8) = pack8h(o);
     }
 }
 

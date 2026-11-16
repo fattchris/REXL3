@@ -2449,6 +2449,48 @@ impl GlmModel {
                 Ok(None)
             }
             Some(count) => {
+                // `REXL3_GLM_LOGITS_DUMP=<path>`: keep every row's logits of this chunk for an oracle comparison (a debug
+                // path: the head runs on all rows, the file gets (start, rows) then the fp16 logits, and the candidates the
+                // engine reads are still the last row's). All ranks must set it (the forward is the same on all of them).
+                if std::env::var_os("REXL3_GLM_LOGITS_DUMP").is_some() {
+                    let n = tokens.len();
+                    let v = self.cfg.vocab;
+                    let slab = self.s.rows.min(alloc::MAX_ROWS);
+                    let mut a = 0usize;
+                    let mut last_count = 0usize;
+                    let mut c_last: Option<Candidates> = None;
+                    while a < n {
+                        let m = (n - a).min(slab);
+                        let bb = RowBatch::from_requests(&[gb_engine::RowRequest {
+                            slot,
+                            tokens: tokens[a..a + m].to_vec(),
+                            first_position: (start + a) as u64,
+                        }]);
+                        self.forward(&bb, Mode::Prefill, Head::AllRows)?;
+                        self.mtp_prefill_chunk(slot, start + a, &tokens[a..a + m])?;
+                        let rows = self.logits_host(0, m)?;
+                        if let Ok(path) = std::env::var("REXL3_GLM_LOGITS_DUMP") {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                let _ = f.write_all(&((start + a) as u32).to_le_bytes());
+                                let _ = f.write_all(&(m as u32).to_le_bytes());
+                                let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+                                let _ = f.write_all(&bytes);
+                            }
+                        }
+                        c_last = Some(self.candidates_of(m, count)?);
+                        last_count = m;
+                        a += m;
+                    }
+                    let c = c_last.ok_or_else(|| ModelError::Request("empty prefill".into()))?;
+                    let at = (last_count - 1) * count;
+                    return Ok(Some(Candidates {
+                        rows: 1,
+                        count,
+                        ids: c.ids[at..at + count].to_vec(),
+                        vals: c.vals[at..at + count].to_vec(),
+                    }));
+                }
                 self.forward(&b, Mode::Prefill, Head::LastRow)?;
                 self.mtp_prefill_chunk(slot, start, tokens)?;
                 self.dflash_prefill_chunk(slot, start, tokens.len())?;
