@@ -103,6 +103,16 @@ impl WqBDevice {
     }
 }
 
+/// The full model's per-token DSA indexer tensors: `wk` (keys), `wq_b` (queries), `weights_proj` (per-head weights) and the key
+/// LayerNorm's gamma/beta. The Flash indexer (pooled, with a k-pool) is [`IndexerDevice`].
+pub struct FullIndexerDevice {
+    pub wq_b: WqBDevice,
+    pub wk: DevBuf,
+    pub weights_proj: DevBuf,
+    pub ln_w: DevBuf,
+    pub ln_b: DevBuf,
+}
+
 /// One MLA layer's tensors.
 pub struct MlaDevice {
     pub q_a: Exl3Weights,
@@ -114,8 +124,10 @@ pub struct MlaDevice {
     pub kv_a_norm: DevBuf,
     /// `kv_b_proj` split and packed (`W_UK`, transposed `W_UV`).
     pub kv_b: mla::MlaWeights,
-    /// `None` on a layer without its own indexer (the full model's shared layers; the Flash model always has one).
+    /// `None` on a layer without its own indexer (the Flash model always has one; the full model's shared layers have none).
     pub indexer: Option<IndexerDevice>,
+    /// The full model's per-token indexer on a layer that computes its own selection.
+    pub full_indexer: Option<FullIndexerDevice>,
 }
 
 pub enum MixerDevice {
@@ -325,9 +337,10 @@ impl Binder<'_> {
 
     /// One MLA layer's tensors (`index`: the layer's checkpoint index, for the messages).
     fn mla(&self, m: &super::weights::MlaWeights, index: usize) -> Result<MlaDevice, ModelError> {
-        // the Flash model's indexer (an EXL3/plain wq_b, wk, weights_proj, the key LayerNorm and the k-pool); a shared layer's is absent, and
-        // the full model's indexer has no k-pool (its DSA path is not ported), so neither is placed here yet
+        // the Flash model's indexer (an EXL3/plain wq_b, wk, weights_proj, the key LayerNorm and the k-pool); the full model's indexer has
+        // no k-pool and is placed as the per-token indexer instead; a shared layer has neither
         let ix = m.indexer.as_ref().filter(|ix| ix.kpool.is_some());
+        let full = m.indexer.as_ref().filter(|ix| ix.kpool.is_none());
         // `kv_b` is the packed copy: `uk` first (64 x 256 x 512 fp16), then `uvt` (64 x 512 x 256 fp16)
         let kvb = self.plain(&m.kv_b_proj)?;
         let half = kvb.bytes() / 2;
@@ -339,6 +352,19 @@ impl Binder<'_> {
             q_a_norm: self.plain(&m.q_a_layernorm)?,
             kv_a_norm: self.plain(&m.kv_a_layernorm)?,
             kv_b: mla::MlaWeights { uk: kvb.subview(0, half), uvt: kvb.subview(half, half), dtype: Dtype::F16 },
+            full_indexer: match full {
+                Some(ix) => Some(FullIndexerDevice {
+                    wq_b: match &ix.wq_b {
+                        IndexerWqB::Exl3(g) => WqBDevice::Exl3(self.exl3(g)?),
+                        IndexerWqB::PlainF16(t) => WqBDevice::F16 { w: self.plain(t)?, k: t.shape[1], n: t.shape[0] },
+                    },
+                    wk: self.plain(&ix.wk)?,
+                    weights_proj: self.plain(&ix.weights_proj)?,
+                    ln_w: self.plain(&ix.k_norm_weight)?,
+                    ln_b: self.plain(&ix.k_norm_bias)?,
+                }),
+                None => None,
+            },
             indexer: match ix {
                 Some(ix) => {
                     let kp = ix.kpool.as_ref().expect("checked above");
