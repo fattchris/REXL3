@@ -575,5 +575,38 @@ fn the_sparse_path_matches_the_host_and_is_gpu_independent() {
         worst = worst.max((g - acc).abs() / (acc.abs() + 1.0));
         assert!((g - acc).abs() <= 5e-2 + 5e-2 * acc.abs(), "sparse o_lat[{c}] {g} vs {acc}");
     }
+    if std::env::var_os("REXL3_SPARSE_PARTIALS").is_some() {
+        // derive the chunk count from the workspace size (the kernel's layout), then print row0h0's per-chunk (m, l)
+        let ch = mla::CHUNK_KEYS;
+        let total = ws.bytes();
+        let mut nfound = 1usize;
+        for n in 1..=64usize {
+            let pairs = rows * 64 * n;
+            let need = ((pairs * 512 * 4 + 255) / 256) * 256 + 2 * (((pairs * 4 + 255) / 256) * 256);
+            if need == total { nfound = n; break; }
+        }
+        let pairs = rows * 64 * nfound;
+        let pm = (((pairs * 512 * 4 + 255) / 256) * 256) / 4;
+        let pl = pm + (((pairs * 4 + 255) / 256) * 256) / 4;
+        let v: Vec<f32> = ws.to_vec().unwrap();
+        let mut line = String::new();
+        let mut host = String::new();
+        let list_len = chosen[0].len();
+        for c in 0..nfound {
+            let b = c;
+            line.push_str(&format!("c{c}=({:.3},{:.1}) ", v[pm + b], v[pl + b]));
+            let lo = c * ch;
+            let hi = ((c + 1) * ch).min(list_len);
+            if lo >= hi { host.push_str(&format!("c{c}=(-,-) ")); continue; }
+            let mut mx = f32::NEG_INFINITY;
+            for i in lo..hi { mx = mx.max(sc[i]); }
+            let mut l = 0f32;
+            for i in lo..hi { l += (sc[i] - mx).exp(); }
+            host.push_str(&format!("c{c}=({:.3},{:.1}) ", mx, l));
+        }
+        eprintln!("gpu  partials nch={nfound}: {line}");
+        eprintln!("host partials: {host}");
+    }
+
     eprintln!("sparse worst rel {worst:.4}; ql[0] {:.4}", ql[0]);
 }
