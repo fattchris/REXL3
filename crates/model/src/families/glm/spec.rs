@@ -604,7 +604,18 @@ impl SpecRuntime {
             .iter()
             .map(|r| {
                 let spans = images.get(r.slot).map_or(&[][..], |v| v.as_slice());
-                m.mtp_book(r.slot)
+                let book = m.mtp_book(r.slot);
+                if std::env::var_os("REXL3_GLM_MTP_DEBUG").is_some() {
+                    eprintln!(
+                        "rexl3 event=mtp_ready slot={} tokens={} max={} head={} book={:?}",
+                        r.slot,
+                        r.tokens.len(),
+                        r.max,
+                        head,
+                        book.as_ref().map(|b| (b.ok, b.first, b.n))
+                    );
+                }
+                book
                     .as_ref()
                     .filter(|b| head && r.max > 0 && b.can_absorb(r.tokens.len()) && window_is_text(spans, b.first, b.n))
                     .map(|b| b.n)

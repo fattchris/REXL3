@@ -129,6 +129,8 @@ struct Binder<'a> {
     own: gb_cuda::moe::ExpertOwnership,
     /// Claimed and not loaded.
     skipped: Vec<Skipped>,
+    /// The MTP layer's own weights may round bf16 to fp16: drafts are verified by the trunk.
+    round_bf16: bool,
 }
 
 fn src(t: &TensorInfo) -> Src {
@@ -157,6 +159,7 @@ impl<'a> Binder<'a> {
     /// A 16-bit plain tensor the kernels read as fp16: an fp16 pack stores it as is; a bf16 pack is narrowed on the way (exact or refused).
     fn plain16(&mut self, name: &str, shape: &[usize], region: RegionId, category: Category) -> PlainTensor {
         match self.inv.plain.get(name).map(|t| t.dtype.as_str()) {
+            Some("BF16") if self.round_bf16 => self.plain_x(name, PlainDtype::Bf16, shape, Xform::Bf16ToF16, region, category),
             Some("BF16") => self.plain_x(name, PlainDtype::Bf16, shape, Xform::Bf16ToF16Exact, region, category),
             _ => self.plain(name, PlainDtype::F16, shape, region, category),
         }
@@ -903,6 +906,7 @@ impl GlmWeights {
             regions: vec![],
             own: own.clone(),
             skipped: vec![],
+            round_bf16: false,
         };
         let skip_tower = cfg.vision.is_some() && !vision;
         for (prefix, why) in &inv.refused {
@@ -960,8 +964,13 @@ impl GlmWeights {
             let region = b.region(RegionKind::Trunk(index));
             let l = format!("{}layers.{index}.", cfg.text_prefix);
             let h = cfg.hidden;
-            let eh_proj = if !inv.groups.contains_key(&format!("{l}eh_proj")) && inv.plain.contains_key(&format!("{l}eh_proj.weight")) {
-                MtpEhProj::PlainF16(b.plain16(&format!("{l}eh_proj.weight"), &[h, 2 * h], region, Category::Mtp))
+            let eh_name = format!("{l}eh_proj.weight");
+            let eh_proj = if !inv.groups.contains_key(&format!("{l}eh_proj")) && inv.plain.contains_key(&eh_name) {
+                if inv.plain.get(&eh_name).is_some_and(|t| t.dtype == "BF16") {
+                    MtpEhProj::PlainBf16(b.plain(&eh_name, PlainDtype::Bf16, &[h, 2 * h], region, Category::Mtp))
+                } else {
+                    MtpEhProj::PlainF16(b.plain16(&eh_name, &[h, 2 * h], region, Category::Mtp))
+                }
             } else {
                 MtpEhProj::Exl3(b.group(&format!("{l}eh_proj"), 2 * h, h, Some(region), Category::Mtp))
             };
@@ -975,7 +984,11 @@ impl GlmWeights {
                 region,
                 Category::Mtp,
             );
-            if let Some(layer) = b.layer(index, *spec, region, Category::Mtp, Category::Mtp) {
+            let prev_round = b.round_bf16;
+            b.round_bf16 = true;
+            let layer = b.layer(index, *spec, region, Category::Mtp, Category::Mtp);
+            b.round_bf16 = prev_round;
+            if let Some(layer) = layer {
                 mtp.push(GlmMtpWeights { eh_proj, enorm, hnorm, shared_head_norm, layer });
             }
         }

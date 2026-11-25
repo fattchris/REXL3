@@ -90,6 +90,9 @@ pub enum Xform {
     /// bf16 narrowed to fp16, which must be exact for every element (a pack that stores in bf16 a tensor the fp16 kernels read): the
     /// conversion goes through f32 and a value fp16 cannot hold exactly fails the load.
     Bf16ToF16Exact,
+    /// bf16 narrowed to fp16 with round-to-nearest (the MTP layer's own weights: drafts are verified by the trunk, so a rounded draft
+    /// weight changes the proposal, never the accepted output).
+    Bf16ToF16,
     /// `kv_b_proj` stored bf16: the same split and pack as [`Xform::PackKvB`], converted to fp16 on the way.
     PackKvBBf16,
     /// `kv_b_proj` of the full model (`[64 * (192 + 256)][512]`): split and packed for the rope MLA kernels, fp16 source.
@@ -120,6 +123,7 @@ impl Xform {
             Xform::Bf16ToF32 => src_bytes * 2,
             Xform::F32ToF16Exact => src_bytes / 2,
             Xform::Bf16ToF16Exact => src_bytes,
+            Xform::Bf16ToF16 => src_bytes,
             Xform::None
             | Xform::CentredBias
             | Xform::PackKvB
@@ -456,6 +460,8 @@ pub enum LmHeadWeights {
 pub enum MtpEhProj {
     Exl3(Exl3Linear),
     PlainF16(PlainTensor),
+    /// The same plain matrix stored bf16 (the full pack's `model-layers.78.eh_proj.weight`): run by `bf16_linear`, not narrowed.
+    PlainBf16(PlainTensor),
 }
 
 /// The NextN/MTP layer (index 45): `eh_proj` fuses the embedded token and the trunk's hidden, then a full MLA + indexer + MoE layer
@@ -798,6 +804,7 @@ impl GlmWeights {
             match &m.eh_proj {
                 MtpEhProj::Exl3(g) => f(Leaf::Exl3(g)),
                 MtpEhProj::PlainF16(t) => f(Leaf::Plain(t)),
+                MtpEhProj::PlainBf16(t) => f(Leaf::Plain(t)),
             }
             for t in [&m.enorm, &m.hnorm, &m.shared_head_norm] {
                 f(Leaf::Plain(t));

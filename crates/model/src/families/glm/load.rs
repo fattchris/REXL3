@@ -200,6 +200,17 @@ pub fn convert(x: Xform, src: &[u8]) -> Result<Vec<u8>, String> {
             }
             Ok(out)
         }
+        Xform::Bf16ToF16 => {
+            if src.len() % 2 != 0 {
+                return Err(format!("a bf16 tensor of {} bytes", src.len()));
+            }
+            let mut out = Vec::with_capacity(src.len());
+            for c in src.chunks_exact(2) {
+                let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                out.extend_from_slice(&f64_to_f16(v as f64).to_le_bytes());
+            }
+            Ok(out)
+        }
         Xform::PackKvBFull => {
             let rows = mla::N_HEADS * (mla::NOPE_DIM_FULL + mla::NOPE_DIM) * mla::LATENT_DIM;
             if src.len() != rows * 2 {

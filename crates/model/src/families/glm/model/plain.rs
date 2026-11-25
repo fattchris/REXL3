@@ -19,7 +19,10 @@ impl GlmModel {
     }
 
     pub(super) fn forward_plain(&mut self, b: &RowBatch, head: Head, max_pos: usize) -> Result<(), ModelError> {
-        let GlmModel { cfg, dev, stream, s, latent, mla_ord, table, cos, sin, sig, idx_keys, tp, own_s, .. } = self;
+        // the commit/flush path needs the window this forward ran: the plain trunk returns before the mHC
+        // schedule's `last_window` assignment, so set it here (the tapped rows and KDA commits read it next call)
+        self.last_window = Some(PendingWindow { win: b.clone() });
+        let GlmModel { cfg, dev, stream, s, latent, mla_ord, table, cos, sin, sig, idx_keys, tp, own_s, mtp, .. } = self;
         let st = &*stream;
         let h = cfg.hidden;
         let rows = b.rows;
@@ -153,6 +156,10 @@ impl GlmModel {
                 }
             }
             gb_cuda::glm_mtp::rmsnorm_f32_f16(&x, &dev.final_norm, &mut s.hidden, n, h, RMS_EPS, st)?;
+            if let Some(m) = mtp.as_ref() {
+                // the NextN drafter's tap: this forward's final-normed rows, before the head moves rows in `hidden`
+                unsafe { glue::copy_rows(s.hidden.ptr() as *const c_void, h, m.tap.ptr(), h, n, h, st)? };
+            }
             match head {
                 Head::None => {}
                 Head::LastRow => {

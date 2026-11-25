@@ -917,6 +917,9 @@ impl GlmModel {
 
     /// Record that `keep` rows of `slot`'s last window were accepted. Applied (for all slots at once) before the next forward.
     pub fn commit(&mut self, slot: usize, keep: usize) {
+        if std::env::var_os("REXL3_GLM_MTP_DEBUG").is_some() {
+            eprintln!("rexl3 event=mtp_model_commit slot={slot} keep={keep}");
+        }
         self.pending.insert(slot, keep);
     }
 
@@ -938,8 +941,14 @@ impl GlmModel {
             self.pending.clear();
             return Ok(());
         };
+        if std::env::var_os("REXL3_GLM_MTP_DEBUG").is_some() {
+            eprintln!("rexl3 event=mtp_flush pending={:?} slots={:?}", self.pending, w.win.seq_slot);
+        }
         let keep: Vec<i32> =
             w.win.seq_slot.iter().map(|&sl| self.pending.get(&(sl as usize)).copied().unwrap_or(0) as i32).collect();
+        if std::env::var_os("REXL3_GLM_MTP_DEBUG").is_some() {
+            eprintln!("rexl3 event=mtp_flush keep={keep:?}");
+        }
         self.pending.clear();
         if keep.iter().all(|&k| k == 0) {
             return Ok(());

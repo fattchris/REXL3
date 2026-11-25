@@ -258,6 +258,7 @@ impl HeadDevice {
 pub enum EhProjDevice {
     Exl3(Exl3Weights),
     F16 { w: DevBuf, k: usize, n: usize },
+    Bf16 { w: DevBuf, k: usize, n: usize },
 }
 
 /// Every weight of the text model on the device.
@@ -522,6 +523,7 @@ impl Binder<'_> {
             eh_proj: match &m.eh_proj {
                 MtpEhProj::Exl3(g) => EhProjDevice::Exl3(self.exl3(g)?),
                 MtpEhProj::PlainF16(t) => EhProjDevice::F16 { w: self.plain(t)?, k: t.shape[1], n: t.shape[0] },
+                MtpEhProj::PlainBf16(t) => EhProjDevice::Bf16 { w: self.plain(t)?, k: t.shape[1], n: t.shape[0] },
             },
             enorm: self.plain(&m.enorm)?,
             hnorm: self.plain(&m.hnorm)?,

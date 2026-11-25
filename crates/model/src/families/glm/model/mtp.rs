@@ -605,6 +605,13 @@ impl GlmModel {
             if kept == 0 {
                 continue;
             }
+            if std::env::var_os("REXL3_GLM_MTP_DEBUG").is_some() {
+                eprintln!(
+                    "rexl3 event=mtp_commit slot={slot} kept={kept} row0={} book={:?}",
+                    win.positions[rows.start],
+                    (m.book[slot].ok, m.book[slot].first, m.book[slot].n)
+                );
+            }
             match m.book[slot].window_commit(win.positions[rows.start] as usize, kept, MTP_TAP_CAP) {
                 Ok(dst) => copy_h(&m.tap, rows.start, &m.store, slot * MTP_TAP_CAP + dst, kept, h, &self.stream)?,
                 // a sequence that never asks for drafts (a serial request) just fills its store: not worth a line
@@ -768,10 +775,16 @@ impl GlmModel {
             super::super::device::EhProjDevice::Exl3(g) => {
                 layers::lin(g, cat, x, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?
             }
-            super::super::device::EhProjDevice::F16 { .. } => {
-                return Err(ModelError::Config(
-                    "the NextN layer's eh_proj is a plain fp16 matrix in this pack; the MTP drafter does not run it yet (--no-drafts serves)".into(),
-                ))
+            super::super::device::EhProjDevice::F16 { w, k, n } => {
+                // the pack's plain fp16 matrix: the small GEMV's fp32 accumulator, the same residual the EXL3 path writes
+                if rows > MAX_ROWS {
+                    unsafe { gb_cuda::glue::small_linear_f16w_f32out_rows(cat.ptr(), w.ptr(), x.ptr(), rows, *k, *n, st)? }
+                } else {
+                    unsafe { gb_cuda::glue::small_linear_f16w_f32out(cat.ptr(), w.ptr(), x.ptr(), rows, *k, *n, st)? }
+                }
+            }
+            super::super::device::EhProjDevice::Bf16 { w, k, n } => {
+                gb_cuda::bf16_linear::forward(cat, w, x, rows, *k, *n, true, st)?
             }
         }
         mark(1)?;

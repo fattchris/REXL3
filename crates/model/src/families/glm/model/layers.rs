@@ -123,6 +123,28 @@ pub(super) fn slab_index(ri: &RowIndex, a: usize, n: usize) -> RowIndex {
     RowIndex { slot: ri.slot.subview(a * 4, n * 4), pos: ri.pos.subview(a * 4, n * 4), rows: n }
 }
 
+/// Fill the sparse selection for a layer without its own indexer (the NextN layer): every row selects its
+/// last `TOPK` keys, ascending. At or below 2,048 keys the list is every key the dense path would read, so the
+/// draft is the dense one; past it the draft sees the recent window, and the trunk still verifies every token.
+fn fill_recency_selection(s: &mut dsa::Scratch, ri: &RowIndex, rows: usize) -> Result<(), ModelError> {
+    let pos: Vec<i32> = ri.pos.to_vec()?;
+    let mut idx = vec![-1i32; rows * dsa::K_STRIDE];
+    let mut meta = vec![0i32; rows * 2];
+    for r in 0..rows {
+        let p = pos[r].max(0) as usize;
+        let count = (p + 1).min(dsa::TOPK);
+        let start = p + 1 - count;
+        for j in 0..count {
+            idx[r * dsa::K_STRIDE + j] = (start + j) as i32;
+        }
+        meta[2 * r] = 1;
+        meta[2 * r + 1] = count as i32;
+    }
+    s.indices.upload(&idx)?;
+    s.meta.upload(&meta)?;
+    Ok(())
+}
+
 /// One MLA layer with the DSA indexer on `rows` rows of `s.hidden` (the final-normed input) at consecutive positions ending at `max_pos`:
 /// writes the sublayer output to `s.mixer_out` (fp32). `ri`: the rows' (slot, position) index, `None` for `s.rowidx`. `mark(name)` is called after
 /// each step (profiling). Above [`MAX_ROWS`] rows (`big`) the projections run over all the rows, the attention in slabs. `after_append`, for a large
@@ -146,7 +168,7 @@ pub(super) fn mla_dsa_mixer(
         Some(r) => r,
         None => &s.rowidx,
     };
-    let ix = w.indexer.as_ref().ok_or_else(|| ModelError::Config("the layer has no indexer".into()))?;
+    let ix = w.indexer.as_ref();
     let h = cfg.hidden;
     lin(&w.q_a, &s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
     glm_glue::rmsnorm_f16(&s.q_a, &w.q_a_norm, &mut s.q_resid, rows, cfg.mla.q_lora_rank, RMS_EPS, st)?;
@@ -155,18 +177,24 @@ pub(super) fn mla_dsa_mixer(
     glm_glue::rmsnorm_f16(&s.kv_a, &w.kv_a_norm, &mut s.ckv, rows, cfg.mla.kv_lora_rank, RMS_EPS, st)?;
     mark("mla: q_a, q_b, kv_a and their norms")?;
     mla::latent_write(&s.ckv, ri, table, latent, rows, st)?;
-    moe::linear_f16(&s.hidden, Dtype::F16, &ix.wk, &mut s.k_raw, rows, h, cfg.indexer.head_dim, st)?;
-    moe::linear_f16(&s.hidden, Dtype::F16, &ix.compress_gate, &mut s.gate, rows, h, cfg.indexer.head_dim, st)?;
-    mark("mla: latent write, indexer wk and gate")?;
+    if let Some(ix) = ix {
+        moe::linear_f16(&s.hidden, Dtype::F16, &ix.wk, &mut s.k_raw, rows, h, cfg.indexer.head_dim, st)?;
+        moe::linear_f16(&s.hidden, Dtype::F16, &ix.compress_gate, &mut s.gate, rows, h, cfg.indexer.head_dim, st)?;
+        mark("mla: latent write, indexer wk and gate")?;
+    }
     if !big {
-        dsa::append(&ix.dsa, planes, &mut s.dsa, &s.k_raw, &s.gate, ri, rows, table, st)?;
-        mark("mla: dsa append")?;
-        if any_sparse {
-            moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
-            ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, false)?;
-            assert!(n_pools_max <= s.dsa.s_stride, "the indexer's score stride bounds the context");
-            dsa::select(planes, &mut s.dsa, &s.iq, &s.wproj, ri, rows, n_pools_max, table, st)?;
-            mark("mla: dsa select (weights_proj, wq_b, scoring, top-k)")?;
+        if let Some(ix) = ix {
+            dsa::append(&ix.dsa, planes, &mut s.dsa, &s.k_raw, &s.gate, ri, rows, table, st)?;
+            mark("mla: dsa append")?;
+            if any_sparse {
+                moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
+                ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, false)?;
+                assert!(n_pools_max <= s.dsa.s_stride, "the indexer's score stride bounds the context");
+                dsa::select(planes, &mut s.dsa, &s.iq, &s.wproj, ri, rows, n_pools_max, table, st)?;
+                mark("mla: dsa select (weights_proj, wq_b, scoring, top-k)")?;
+            }
+        } else if any_sparse {
+            fill_recency_selection(&mut s.dsa, ri, rows)?;
         }
         let sel = SparseSel { indices: &s.dsa.indices, meta: &s.dsa.meta, stride: dsa::K_STRIDE };
         // under P2 the absorb and expand of a prompt chunk's rows take the P2 tensor-core kernels (step (d)); the attention is P1's
@@ -193,9 +221,11 @@ pub(super) fn mla_dsa_mixer(
 
     // a large chunk: the indexer's two remaining projections over all the rows (only when some slab selects), then the slabs in order
     if any_sparse {
-        moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
-        ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, true)?;
-        mark("mla: indexer weights_proj and wq_b")?;
+        if let Some(ix) = ix {
+            moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
+            ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, true)?;
+            mark("mla: indexer weights_proj and wq_b")?;
+        }
     }
     let (qd, ihd, ihs) = (cfg.mla.heads * cfg.mla.qk_head_dim(), cfg.indexer.head_dim, cfg.indexer.heads);
     let ovd = cfg.mla.heads * cfg.mla.v_head_dim;
@@ -205,18 +235,22 @@ pub(super) fn mla_dsa_mixer(
         let slab_max = max_pos - (rows - (a + n));
         let ri_s = slab_index(ri, a, n);
         let (kraw, gate) = (s.k_raw.subview(a * ihd * 2, n * ihd * 2), s.gate.subview(a * ihd * 2, n * ihd * 2));
-        dsa::append(&ix.dsa, planes, &mut s.dsa, &kraw, &gate, &ri_s, n, table, st)?;
-        if let Some(h) = after_append.as_mut() {
-            h(a, n, &*planes)?;
-        }
-        mark("mla: dsa append (slabs)")?;
-        if dsa::is_sparse(slab_max) {
-            let n_pools_max = (slab_max + 1) / dsa::P;
-            let iq = s.iq.subview(a * ihs * ihd * 2, n * ihs * ihd * 2);
-            let wproj = s.wproj.subview(a * ihs * 2, n * ihs * 2);
-            assert!(n_pools_max <= s.dsa.s_stride, "the indexer's score stride bounds the context");
-            dsa::select(planes, &mut s.dsa, &iq, &wproj, &ri_s, n, n_pools_max, table, st)?;
-            mark("mla: dsa select (slabs)")?;
+        if let Some(ix) = ix {
+            dsa::append(&ix.dsa, planes, &mut s.dsa, &kraw, &gate, &ri_s, n, table, st)?;
+            if let Some(h) = after_append.as_mut() {
+                h(a, n, &*planes)?;
+            }
+            mark("mla: dsa append (slabs)")?;
+            if dsa::is_sparse(slab_max) {
+                let n_pools_max = (slab_max + 1) / dsa::P;
+                let iq = s.iq.subview(a * ihs * ihd * 2, n * ihs * ihd * 2);
+                let wproj = s.wproj.subview(a * ihs * 2, n * ihs * 2);
+                assert!(n_pools_max <= s.dsa.s_stride, "the indexer's score stride bounds the context");
+                dsa::select(planes, &mut s.dsa, &iq, &wproj, &ri_s, n, n_pools_max, table, st)?;
+                mark("mla: dsa select (slabs)")?;
+            }
+        } else if dsa::is_sparse(slab_max) {
+            fill_recency_selection(&mut s.dsa, &ri_s, n)?;
         }
         let sel = SparseSel { indices: &s.dsa.indices, meta: &s.dsa.meta, stride: dsa::K_STRIDE };
         let qv = s.q.subview(a * qd * 2, n * qd * 2);

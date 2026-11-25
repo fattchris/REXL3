@@ -55,14 +55,18 @@ pub fn draft_head_planned(drafts: bool, lm_head: &super::weights::LmHeadWeights,
     if !drafts {
         return Ok(0);
     }
+    let setting = mtp_vocab_setting(std::env::var("REXL3_MTP_VOCAB").ok().as_deref()).map_err(ModelError::Config)?;
+    let Some((strips, _)) = setting else {
+        // the full head: no restricted copy, whatever the head's format (the MTP layer runs it through `HeadDevice`)
+        return Ok(0);
+    };
     let super::weights::LmHeadWeights::Exl3(lm_head) = lm_head else {
         return Err(ModelError::Config(
             "the NextN drafter's restricted head needs an EXL3 lm_head; this pack stores the head as a plain fp16 matrix".into(),
         ));
     };
-    let setting = mtp_vocab_setting(std::env::var("REXL3_MTP_VOCAB").ok().as_deref()).map_err(ModelError::Config)?;
     let bits = lm_head.bits.twice() as usize / 2;
-    Ok(setting.map_or(0, |(strips, _)| super::model::sub_head_bytes(lm_head.k, bits, &super::model::vocab_ranges(strips, vocab))))
+    Ok(super::model::sub_head_bytes(lm_head.k, bits, &super::model::vocab_ranges(strips, vocab)))
 }
 
 /// `REXL3_MTP_VOCAB`: unset is the default (`MTP_VOCAB_PREFIX_STRIPS`, share `MTP_VOCAB_MIN_SHARE`), `off` / `0` / `full` the full head, `N` that many
@@ -237,14 +241,7 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     let pack = GlmPack::from_checkpoint_with(&ck, cfg.clone(), o.vision.is_some())?;
     // the drafter's restricted head, built after the load: charged to the plan now (`draft_head_planned`; the build checks its bytes against it)
     let draft_head = draft_head_planned(with_mtp && o.spec.drafts(), &pack.weights.lm_head, cfg.vocab)?;
-    // the NextN layer's input fusion: an EXL3 group in the Flash pack, a plain fp16 matrix in the full pack. The drafter runs only the
-    // EXL3 form; a plain one refuses here instead of at the first draft.
-    if with_mtp && pack.weights.mtp.iter().any(|m| matches!(m.eh_proj, super::weights::MtpEhProj::PlainF16(_))) {
-        return Err(ModelError::Config(
-            "the NextN layer's eh_proj is a plain fp16 matrix in this pack; the MTP drafter does not run it yet (serve with --no-drafts)"
-                .into(),
-        ));
-    }
+    // the NextN layer's input fusion: an EXL3 group in the Flash pack, a plain fp16 matrix in the full pack; both run below.
     let scan_s = t.elapsed().as_secs_f64();
     boot::mark("packs_scanned", None);
     let target_fingerprint = check_pack(&ck, draft_check_of(o, &cfg)?.as_ref(), o.allow_unvalidated_pack)?;
